@@ -387,10 +387,15 @@ impl TDriveView {
             LoginStep::NeedCredentials => {
                 login_button("connect", "Connect", view.clone(), LoginAction::Connect)
             }
-            LoginStep::NeedPhone => {
-                login_button("send-code", "Send code", view.clone(), LoginAction::SendCode)
+            LoginStep::NeedPhone => login_button(
+                "send-code",
+                "Send code",
+                view.clone(),
+                LoginAction::SendCode,
+            ),
+            LoginStep::NeedCode => {
+                login_button("verify", "Verify", view.clone(), LoginAction::Verify)
             }
-            LoginStep::NeedCode => login_button("verify", "Verify", view.clone(), LoginAction::Verify),
             LoginStep::NeedPassword => {
                 login_button("unlock", "Unlock", view.clone(), LoginAction::Unlock)
             }
@@ -575,9 +580,10 @@ impl TDriveView {
                     .gap(px(2.))
                     .children(shared_items)
                     .children(loading.then(|| drive_empty("Loading...")))
-                    .children((!loading && self.state.dialogs.is_empty()).then(|| {
-                        drive_empty("No shared drives yet")
-                    })),
+                    .children(
+                        (!loading && self.state.dialogs.is_empty())
+                            .then(|| drive_empty("No shared drives yet")),
+                    ),
             );
 
         div()
@@ -714,11 +720,15 @@ impl TDriveView {
             .border_b_1()
             .border_color(theme::border_soft())
             .child(
-                div().w(px(theme::SEARCH_W)).min_w_0().flex_shrink_0().child(
-                    Input::new(&self.search_input)
-                        .prefix(glyph(IconName::Search, 16., theme::text_muted()))
-                        .cleanable(true),
-                ),
+                div()
+                    .w(px(theme::SEARCH_W))
+                    .min_w_0()
+                    .flex_shrink_0()
+                    .child(
+                        Input::new(&self.search_input)
+                            .prefix(glyph(IconName::Search, 16., theme::text_muted()))
+                            .cleanable(true),
+                    ),
             )
             .child(
                 div()
@@ -855,18 +865,18 @@ impl TDriveView {
                     .pl(px(theme::NAME_INSET))
                     .child(sort_button(view.clone(), SortKey::Name, "Name", sort)),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(96.))
-                    .child(sort_button(view.clone(), SortKey::Date, date_label, sort)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(84.))
-                    .child(sort_button(view.clone(), SortKey::Size, "Size", sort)),
-            )
+            .child(div().flex_1().min_w(px(96.)).child(sort_button(
+                view.clone(),
+                SortKey::Date,
+                date_label,
+                sort,
+            )))
+            .child(div().flex_1().min_w(px(84.)).child(sort_button(
+                view.clone(),
+                SortKey::Size,
+                "Size",
+                sort,
+            )))
             .child(
                 div()
                     .w(px(theme::COL_ACTIONS_W))
@@ -948,7 +958,11 @@ impl TDriveView {
                 "Pick a drive on the left to see its files.",
             )
         } else if self.state.photos_only() {
-            (IconName::Images, "No photos here", "This drive has no images.")
+            (
+                IconName::Images,
+                "No photos here",
+                "This drive has no images.",
+            )
         } else if !self.state.query.trim().is_empty() {
             (
                 IconName::SearchX,
@@ -1338,9 +1352,14 @@ fn sort_button(
         .rounded(px(6.))
         .cursor_pointer()
         .when(active, |el| {
-            el.bg(theme::overlay_white_1()).text_color(theme::text_soft())
+            el.bg(theme::overlay_white_1())
+                .text_color(theme::text_soft())
         })
-        .hover(|style| style.bg(theme::overlay_white_1()).text_color(theme::text_soft()))
+        .hover(|style| {
+            style
+                .bg(theme::overlay_white_1())
+                .text_color(theme::text_soft())
+        })
         .on_click(move |_, _window, cx| {
             view.update(cx, |this, cx| {
                 this.state.sort.toggle(key);
@@ -1348,19 +1367,23 @@ fn sort_button(
             });
         })
         .child(label)
-        .child(div().w(px(10.)).flex().justify_center().children(active.then(
-            || {
-                glyph(
-                    if sort.ascending {
-                        IconName::ChevronUp
-                    } else {
-                        IconName::ChevronDown
-                    },
-                    12.,
-                    theme::accent(),
-                )
-            },
-        )))
+        .child(
+            div()
+                .w(px(10.))
+                .flex()
+                .justify_center()
+                .children(active.then(|| {
+                    glyph(
+                        if sort.ascending {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        },
+                        12.,
+                        theme::accent(),
+                    )
+                })),
+        )
         .into_any_element()
 }
 
@@ -1368,7 +1391,11 @@ fn sort_button(
 /// it; the second empties. With nothing to empty the control is absent rather
 /// than disabled, as in the original shell.
 fn empty_trash_button(view: Entity<TDriveView>, armed: bool) -> AnyElement {
-    let label = if armed { "Delete everything?" } else { "Empty trash" };
+    let label = if armed {
+        "Delete everything?"
+    } else {
+        "Empty trash"
+    };
     let button_view = view.clone();
     div()
         .id("trash-empty-btn")
@@ -1451,20 +1478,8 @@ fn skeleton_row(index: usize) -> AnyElement {
                 )
                 .child(bar(160. + (index as f32) * 14.)),
         )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(96.))
-                .flex()
-                .child(bar(58.)),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(84.))
-                .flex()
-                .child(bar(44.)),
-        )
+        .child(div().flex_1().min_w(px(96.)).flex().child(bar(58.)))
+        .child(div().flex_1().min_w(px(84.)).flex().child(bar(44.)))
         .child(
             div()
                 .w(px(theme::COL_ACTIONS_W))
@@ -1521,9 +1536,12 @@ fn login_button(
     view: Entity<TDriveView>,
     action: LoginAction,
 ) -> Button {
-    Button::new(id).primary().label(label).on_click(move |_, _window, cx| {
-        run_login_action(view.clone(), &action, cx);
-    })
+    Button::new(id)
+        .primary()
+        .label(label)
+        .on_click(move |_, _window, cx| {
+            run_login_action(view.clone(), &action, cx);
+        })
 }
 
 fn run_login_action(view: Entity<TDriveView>, action: &LoginAction, cx: &mut App) {
@@ -1777,11 +1795,8 @@ fn spawn_load_dialogs_inner(view: Entity<TDriveView>, client: TeleClient, cx: &m
                     Ok(dialogs) => {
                         this.state.dialogs = dialogs;
                         this.state.status = format!("{} drives", this.state.dialogs.len());
-                        let first_personal = this
-                            .state
-                            .dialogs
-                            .iter()
-                            .position(|d| d.kind.is_personal());
+                        let first_personal =
+                            this.state.dialogs.iter().position(|d| d.kind.is_personal());
                         if let Some(index) = first_personal {
                             spawn_open_drive_inner(view.clone(), index, cx);
                         }
@@ -1807,12 +1822,7 @@ fn spawn_open_drive_inner(view: Entity<TDriveView>, index: usize, cx: &mut App) 
         let Some(dialog) = this.state.dialogs.get(index) else {
             return;
         };
-        (
-            client,
-            dialog.peer_ref,
-            dialog.title.clone(),
-            dialog.id,
-        )
+        (client, dialog.peer_ref, dialog.title.clone(), dialog.id)
     };
 
     view.update(cx, |this, cx| {
@@ -1931,7 +1941,8 @@ fn spawn_download(view: Entity<TDriveView>, index: usize, cx: &mut App) {
 fn spawn_upload(view: Entity<TDriveView>, cx: &mut App) {
     let (client, peer_ref) = {
         let this = view.read(cx);
-        let (Some(client), Some(dialog)) = (this.state.tele.clone(), this.state.active_dialog()) else {
+        let (Some(client), Some(dialog)) = (this.state.tele.clone(), this.state.active_dialog())
+        else {
             // An upload has nothing to write to without a session, so say so
             // rather than leaving the button looking inert.
             view.update(cx, |this, cx| {

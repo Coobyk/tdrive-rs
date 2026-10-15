@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use grammers_client::client::{LoginToken, PasswordToken};
 use grammers_client::Client;
+use grammers_client::client::{LoginToken, PasswordToken};
 use grammers_session::types::PeerRef;
 
 #[derive(Debug, Clone)]
@@ -77,8 +77,8 @@ impl FileKind {
         }
         let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
         match ext.as_str() {
-            "jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "heif" | "avif" | "bmp"
-            | "tiff" | "tif" | "svg" | "ico" | "psd" => FileKind::Image,
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "heif" | "avif" | "bmp" | "tiff"
+            | "tif" | "svg" | "ico" | "psd" => FileKind::Image,
             "mp4" | "mkv" | "mov" | "webm" | "avi" | "m4v" | "wmv" | "flv" | "mpg" | "mpeg"
             | "3gp" => FileKind::Video,
             "mp3" | "m4a" | "flac" | "wav" | "aac" | "ogg" | "opus" | "wma" | "aiff" | "mid" => {
@@ -457,21 +457,17 @@ impl AppState {
         ];
         self.status = format!("{} drives", self.dialogs.len());
 
-        let file = |message_id: i32,
-                    name: &str,
-                    size: i64,
-                    kind: FileKind,
-                    hours: i64|
-         -> RemoteFile {
-            RemoteFile {
-                message_id,
-                name: name.to_string(),
-                size,
-                kind,
-                date: Some(now - Duration::hours(hours)),
-                local_state: LocalState::Remote,
-            }
-        };
+        let file =
+            |message_id: i32, name: &str, size: i64, kind: FileKind, hours: i64| -> RemoteFile {
+                RemoteFile {
+                    message_id,
+                    name: name.to_string(),
+                    size,
+                    kind,
+                    date: Some(now - Duration::hours(hours)),
+                    local_state: LocalState::Remote,
+                }
+            };
 
         self.files = vec![
             file(99, "Design assets", 0, FileKind::Folder, 1),

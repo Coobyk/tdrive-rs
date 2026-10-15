@@ -10,12 +10,15 @@ use tokio::runtime::Runtime;
 
 use crate::models::{Credentials, DialogInfo, DialogKind, FileKind, LocalState, RemoteFile};
 
-pub static RT: std::sync::LazyLock<Runtime> = std::sync::LazyLock::new(|| {
-    Runtime::new().expect("tokio runtime")
-});
+pub static RT: std::sync::LazyLock<Runtime> =
+    std::sync::LazyLock::new(|| Runtime::new().expect("tokio runtime"));
 
 pub async fn async_connect(creds: &Credentials, session_path: PathBuf) -> Result<Client, String> {
-    let session = Arc::new(SqliteSession::open(session_path).await.map_err(|e| e.to_string())?);
+    let session = Arc::new(
+        SqliteSession::open(session_path)
+            .await
+            .map_err(|e| e.to_string())?,
+    );
     let SenderPool { runner, handle, .. } = SenderPool::new(Arc::clone(&session), creds.api_id);
     let client = Client::new(handle);
     tokio::spawn(runner.run());
@@ -91,7 +94,10 @@ pub async fn async_list_dialogs(client: &Client) -> Result<Vec<DialogInfo>, Stri
     Ok(out)
 }
 
-pub async fn async_list_files(client: &Client, peer_ref: PeerRef) -> Result<Vec<RemoteFile>, String> {
+pub async fn async_list_files(
+    client: &Client,
+    peer_ref: PeerRef,
+) -> Result<Vec<RemoteFile>, String> {
     let mut messages = client.iter_messages(peer_ref);
     let mut out = Vec::new();
     let mut seen = 0usize;

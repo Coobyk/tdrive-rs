@@ -30,10 +30,7 @@ pub fn short_date(date: Option<DateTime<Utc>>) -> String {
 /// `purgeCountdown` from `ui/trash/trash-view.ts`: how long is left before the
 /// backend purges a deleted item, in the words a person would use. The second
 /// value is the original's `urgent` flag, which colours the line.
-pub fn purge_countdown(
-    purge_after: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> (String, bool) {
+pub fn purge_countdown(purge_after: Option<DateTime<Utc>>, now: DateTime<Utc>) -> (String, bool) {
     const MINUTE: i64 = 60_000;
     const HOUR: i64 = 60 * MINUTE;
     const DAY: i64 = 24 * HOUR;
@@ -90,7 +87,11 @@ fn falls_tomorrow(deadline: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 /// and how big it was.
 pub fn entry_origin(origin: &str, size: i64, is_file: bool) -> String {
     let origin = origin.trim();
-    let origin = if origin.is_empty() { "Drive root" } else { origin };
+    let origin = if origin.is_empty() {
+        "Drive root"
+    } else {
+        origin
+    };
     if is_file && size > 0 {
         format!("{origin} · {}", human_size(size))
     } else {
@@ -120,11 +121,17 @@ mod tests {
             purge_countdown(after(Duration::minutes(30)), now).0,
             "Less than an hour left"
         );
-        assert_eq!(purge_countdown(after(Duration::hours(1)), now).0, "1 hour left");
+        assert_eq!(
+            purge_countdown(after(Duration::hours(1)), now).0,
+            "1 hour left"
+        );
         assert_eq!(
             purge_countdown(after(Duration::hours(5)), now).0,
             "5 hours left"
         );
-        assert_eq!(purge_countdown(after(Duration::days(30)), now).0, "30 days left");
+        assert_eq!(
+            purge_countdown(after(Duration::days(30)), now).0,
+            "30 days left"
+        );
     }
 }
