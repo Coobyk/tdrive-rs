@@ -1620,13 +1620,11 @@ fn connect_telegram(view: Entity<TDriveView>, cx: &mut App) {
             });
         });
 
+        // Run the listing after the update above: it updates this same view.
         if authorized {
-            cx.update(|cx| {
-                let client = view.read(cx).state.tele.clone();
-                if let Some(client) = client {
-                    spawn_load_dialogs_inner(view.clone(), client, cx);
-                }
-            });
+            if let Some(client) = client {
+                cx.update(|cx| spawn_load_dialogs_inner(view, client, cx));
+            }
         }
     })
     .detach();
@@ -1705,25 +1703,33 @@ fn verify_login_code(view: Entity<TDriveView>, cx: &mut App) {
         let result = cx
             .background_spawn(async move { tele::sign_in(&client, token, &code) })
             .await;
-        cx.update(|cx| {
+        // The listing helper updates this same view, so hand it the client out
+        // of the closure instead of calling it while the view is leased.
+        let to_list = cx.update(|cx| {
             view.update(cx, |this, cx| {
                 this.state.login.working = None;
-                match result {
+                let client = match result {
                     Ok(None) => {
                         this.state.login.step = LoginStep::LoggedIn;
-                        if let Some(client) = this.state.tele.clone() {
-                            spawn_load_dialogs_inner(view.clone(), client, cx);
-                        }
+                        this.state.tele.clone()
                     }
                     Ok(Some(token)) => {
                         this.state.login.password_token = Some(token);
                         this.state.login.step = LoginStep::NeedPassword;
+                        None
                     }
-                    Err(message) => this.state.login.error = Some(message),
-                }
+                    Err(message) => {
+                        this.state.login.error = Some(message);
+                        None
+                    }
+                };
                 cx.notify();
-            });
+                client
+            })
         });
+        if let Some(client) = to_list {
+            cx.update(|cx| spawn_load_dialogs_inner(view, client, cx));
+        }
     })
     .detach();
 }
@@ -1750,21 +1756,26 @@ fn unlock_two_factor(view: Entity<TDriveView>, cx: &mut App) {
         let result = cx
             .background_spawn(async move { tele::check_password(&client, token, &password) })
             .await;
-        cx.update(|cx| {
+        let to_list = cx.update(|cx| {
             view.update(cx, |this, cx| {
                 this.state.login.working = None;
-                match result {
+                let client = match result {
                     Ok(_) => {
                         this.state.login.step = LoginStep::LoggedIn;
-                        if let Some(client) = this.state.tele.clone() {
-                            spawn_load_dialogs_inner(view.clone(), client, cx);
-                        }
+                        this.state.tele.clone()
                     }
-                    Err(message) => this.state.login.error = Some(message),
-                }
+                    Err(message) => {
+                        this.state.login.error = Some(message);
+                        None
+                    }
+                };
                 cx.notify();
-            });
+                client
+            })
         });
+        if let Some(client) = to_list {
+            cx.update(|cx| spawn_load_dialogs_inner(view, client, cx));
+        }
     })
     .detach();
 }
@@ -1775,6 +1786,12 @@ fn open_drive_clicked(view: Entity<TDriveView>, index: usize, cx: &mut App) {
     spawn_open_drive_inner(view, index, cx);
 }
 
+/// Load the drive list, then open the first personal drive.
+///
+/// Like the other task helpers here this leases the view, so it must be called
+/// from outside a `view.update` closure. GPUI panics if an entity is read while
+/// it is being updated, which is why follow-up work is returned out of the
+/// closures below instead of being started inside them.
 fn spawn_load_dialogs_inner(view: Entity<TDriveView>, client: TeleClient, cx: &mut App) {
     view.update(cx, |this, cx| {
         this.state.dialogs_loading = true;
@@ -1788,24 +1805,27 @@ fn spawn_load_dialogs_inner(view: Entity<TDriveView>, client: TeleClient, cx: &m
                 async move { tele::list_dialogs(&client) }
             })
             .await;
-        cx.update(|cx| {
+        let to_open = cx.update(|cx| {
             view.update(cx, |this, cx| {
                 this.state.dialogs_loading = false;
-                match result {
+                let first_personal = match result {
                     Ok(dialogs) => {
                         this.state.dialogs = dialogs;
                         this.state.status = format!("{} drives", this.state.dialogs.len());
-                        let first_personal =
-                            this.state.dialogs.iter().position(|d| d.kind.is_personal());
-                        if let Some(index) = first_personal {
-                            spawn_open_drive_inner(view.clone(), index, cx);
-                        }
+                        this.state.dialogs.iter().position(|d| d.kind.is_personal())
                     }
-                    Err(message) => this.state.error = Some(message),
-                }
+                    Err(message) => {
+                        this.state.error = Some(message);
+                        None
+                    }
+                };
                 cx.notify();
-            });
+                first_personal
+            })
         });
+        if let Some(index) = to_open {
+            cx.update(|cx| spawn_open_drive_inner(view, index, cx));
+        }
     })
     .detach();
 }
@@ -1813,6 +1833,9 @@ fn spawn_load_dialogs_inner(view: Entity<TDriveView>, client: TeleClient, cx: &m
 /// Load a drive's files. Telegram has no notion of cancelling a request, so a
 /// reply that arrives after the user has moved to another drive is dropped
 /// rather than allowed to overwrite the list they are now looking at.
+///
+/// Must not be called from inside a `view.update` closure; interrupt the
+/// closure and let it return first.
 fn spawn_open_drive_inner(view: Entity<TDriveView>, index: usize, cx: &mut App) {
     let (client, peer_ref, title, dialog_id) = {
         let this = view.read(cx);
@@ -1983,21 +2006,23 @@ fn spawn_upload(view: Entity<TDriveView>, cx: &mut App) {
         let result = cx
             .background_spawn(async move { tele::upload_file(&client, peer_ref, &path) })
             .await;
-        cx.update(|cx| {
+        let to_reload = cx.update(|cx| {
             view.update(cx, |this, cx| match result {
                 Ok(()) => {
                     this.state.status = format!("Uploaded {label}");
-                    if let Some(index) = this.state.active_drive {
-                        spawn_open_drive_inner(view.clone(), index, cx);
-                    }
                     cx.notify();
+                    this.state.active_drive
                 }
                 Err(message) => {
                     this.state.error = Some(message);
                     cx.notify();
+                    None
                 }
-            });
+            })
         });
+        if let Some(index) = to_reload {
+            cx.update(|cx| spawn_open_drive_inner(view, index, cx));
+        }
     })
     .detach();
 }
