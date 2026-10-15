@@ -1,0 +1,27 @@
+[package]
+name = "tdrive-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+arboard = "3"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "5"
+gpui = { package = "gpui-pre", version = "0.3.7", features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.7", features = ["font-kit", "x11", "wayland"] }
+gpui-component = "=0.7.0"
+gpui-kit-assets = "=0.7.0"
+grammers-client = "0.10"
+grammers-mtsender = "0.10"
+grammers-session = "0.10"
+libc = "=0.2.189"
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
