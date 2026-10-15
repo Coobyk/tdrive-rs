@@ -7161,6 +7161,7 @@ dependencies = [
  "chrono",
  "directories",
  "gpui-component",
+ "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
  "grammers-client",
