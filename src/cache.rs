@@ -18,7 +18,13 @@ use crate::tele::ReplayState;
 
 /// The snapshot format. Bump it whenever [`ReplayState`] changes shape, so an
 /// older file is rebuilt instead of misread.
-pub const VERSION: u32 = 1;
+///
+/// 2: revisions became load-bearing. Every object's revision is now what a
+/// delete, a restore or a purge names, so a file written before they were
+/// tracked -- where every row read as zero -- has to be rebuilt from the
+/// drive's history rather than resumed: no operation the drive applies names
+/// revision zero.
+pub const VERSION: u32 = 2;
 
 /// One drive's projected state, and the message it was projected up to.
 #[derive(serde::Serialize, serde::Deserialize)]
