@@ -59,17 +59,6 @@ pub fn invalidate(drive_id: i64) {
     invalidate_in(&dir(), drive_id)
 }
 
-/// Drop one object from a drive's snapshot.
-///
-/// Deleting a drive object removes the message that carried its operation, and
-/// a message that is gone is invisible to a watermark: the object has to be
-/// taken out of the cached projection as well, or it comes back on the next
-/// launch. Removing it here is what a full rebuild would produce, because a
-/// full rebuild no longer sees the message either.
-pub fn forget_object(drive_id: i64, object_id: &str) {
-    forget_object_in(&dir(), drive_id, object_id)
-}
-
 /// [`load`], reading from an explicit directory.
 pub fn load_in(dir: &Path, drive_id: i64) -> Option<Snapshot> {
     let raw = std::fs::read_to_string(path_in(dir, drive_id)).ok()?;
@@ -97,17 +86,6 @@ pub fn save_in(dir: &Path, snapshot: &Snapshot) -> Result<(), String> {
 /// [`invalidate`], on an explicit directory.
 pub fn invalidate_in(dir: &Path, drive_id: i64) {
     let _ = std::fs::remove_file(path_in(dir, drive_id));
-}
-
-/// [`forget_object`], on an explicit directory.
-pub fn forget_object_in(dir: &Path, drive_id: i64, object_id: &str) {
-    let Some(mut snapshot) = load_in(dir, drive_id) else {
-        return;
-    };
-    if snapshot.state.objects.remove(object_id).is_none() {
-        return;
-    }
-    let _ = save_in(dir, &snapshot);
 }
 
 #[cfg(test)]
@@ -199,22 +177,12 @@ mod tests {
         assert!(load_in(&dir, 4).is_none());
     }
 
-    /// Reloading a drive throws the snapshot away, and forgetting one object
-    /// takes it out of the cached projection without disturbing the rest.
+    /// Reloading a drive throws the snapshot away, so the next load reads the
+    /// drive's history again.
     #[test]
-    fn invalidating_and_forgetting_change_what_the_next_launch_sees() {
+    fn a_reload_throws_the_snapshot_away() {
         let dir = scratch("invalidate");
         save_in(&dir, &snapshot(5)).expect("written");
-
-        forget_object_in(&dir, 5, "f:7");
-        let after = load_in(&dir, 5).expect("still there");
-        assert!(
-            after.state.objects.is_empty(),
-            "the deleted object is gone from the cache"
-        );
-
-        // Forgetting an object the state does not hold leaves the file alone.
-        forget_object_in(&dir, 5, "f:999");
         assert!(load_in(&dir, 5).is_some());
 
         invalidate_in(&dir, 5);

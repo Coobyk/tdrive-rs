@@ -892,6 +892,41 @@ impl AppState {
     /// row can say so. The origin is passed in rather than read from the active
     /// drive, because a drive switch while a delete is in flight must not
     /// relabel where the file came from. Returns the entry that was added.
+    /// A name that is free to use under a folder, as the original's
+    /// `NextFreeSiblingName` picks one: the name itself, or `name (2).ext` and
+    /// so on, keeping a file's extension.
+    ///
+    /// The original compares canonical name keys -- NFC-normalised and
+    /// case-folded -- so its unique sibling index cannot be violated by a
+    /// restore. This compares names lowercased, which answers the same way for
+    /// every name that differs only in case; a name that folds in some other
+    /// way would be refused by the drive's own guard rather than accepted twice.
+    pub fn free_sibling_name(&self, parent: &str, name: &str, is_folder: bool) -> String {
+        let taken: Vec<String> = self
+            .files
+            .iter()
+            .filter(|file| file.parent == parent)
+            .map(|file| file.name.to_lowercase())
+            .collect();
+        let free = |candidate: &str| !taken.iter().any(|taken| *taken == candidate.to_lowercase());
+        if free(name) {
+            return name.to_string();
+        }
+
+        let (stem, extension) = if is_folder {
+            (name, "")
+        } else {
+            split_extension(name)
+        };
+        for attempt in 2..=1000 {
+            let candidate = format!("{stem} ({attempt}){extension}");
+            if free(&candidate) {
+                return candidate;
+            }
+        }
+        name.to_string()
+    }
+
     pub fn trash_file(&mut self, index: usize, origin: &str) -> Option<TrashEntry> {
         if index >= self.files.len() {
             return None;
@@ -1105,6 +1140,16 @@ impl AppState {
             ];
             self.status = "3 channels found".to_string();
         }
+    }
+}
+
+/// Split a name into its stem and extension the way the original's
+/// `splitLegacyFileExtension` does: on the last dot, which is ignored when it
+/// leads the name or when what follows is longer than 32 bytes.
+fn split_extension(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 && name.len() - dot <= 32 => (&name[..dot], &name[dot..]),
+        _ => (name, ""),
     }
 }
 
@@ -1360,7 +1405,11 @@ mod tests {
             Some(3),
             "the selected row is the file, not its position in the list"
         );
-        assert_eq!(state.visible_files(), vec![0, 3], "the folder, then the file");
+        assert_eq!(
+            state.visible_files(),
+            vec![0, 3],
+            "the folder, then the file"
+        );
     }
 
     /// A search is a file-list view, so it leaves Photos mode rather than
@@ -1378,6 +1427,61 @@ mod tests {
         assert_eq!(state.view, ViewMode::Drive);
         assert!(!state.photos_only());
         assert_eq!(state.visible_files(), vec![0]);
+    }
+
+    /// A restore that lands on a name someone else has takes the next free one,
+    /// and a file keeps its extension when it moves over, as the original's
+    /// `NextFreeSiblingName` writes it.
+    #[test]
+    fn a_taken_name_moves_over_for_a_restore() {
+        let state = AppState {
+            files: vec![
+                file(1, "Report.PDF", 10, ""),
+                file(2, "Notes.txt", 10, "d:1"),
+                file(3, "Notes (2).txt", 10, "d:1"),
+                folder(4, "Docs", "d:1"),
+            ],
+            ..AppState::default()
+        };
+
+        // A free name is used as it is, whatever case it is in.
+        assert_eq!(
+            state.free_sibling_name("", "Holiday.jpg", false),
+            "Holiday.jpg"
+        );
+        assert_eq!(
+            state.free_sibling_name("d:1", "Notes.txt", false),
+            "Notes (3).txt",
+            "the number is the first that is free, not the second"
+        );
+        assert_eq!(
+            state.free_sibling_name("", "report.pdf", false),
+            "report (2).pdf",
+            "a name taken in another case is still taken"
+        );
+        assert_eq!(
+            state.free_sibling_name("d:1", "Docs", true),
+            "Docs (2)",
+            "a folder keeps its whole name"
+        );
+
+        // The extension is the last dot, and a name that is all dots is not
+        // split at all, as the original's splitter reads it. Both need the name
+        // to be taken first, or there is nothing to move over.
+        let long = format!("archive.{}", "e".repeat(33));
+        let mut state = state;
+        state.files.push(file(5, ".gitignore", 10, "d:1"));
+        state.files.push(file(6, &long, 10, "d:1"));
+        assert_eq!(
+            state.free_sibling_name("d:1", ".gitignore", false),
+            ".gitignore (2)",
+            "a leading dot is part of the stem, not an extension"
+        );
+        assert_eq!(
+            state.free_sibling_name("d:1", &long, false),
+            format!("{long} (2)"),
+            "a suffix too long to be an extension stays part of the stem"
+        );
     }
 
     /// The key is kept when the same drive is reopened and dropped when a drive

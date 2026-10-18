@@ -10,7 +10,7 @@
 //!   and says where it belongs, so a drive can hold ordinary chatter without
 //!   that chatter turning into files.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -386,7 +386,10 @@ fn row_from_op(
         encrypted,
         plaintext_size,
         content,
-        revision: 0,
+        // Every object starts at revision 1: the drive's tables default to it,
+        // and it is the revision a delete of an object never since changed
+        // names against.
+        revision: 1,
     }
 }
 
@@ -558,7 +561,6 @@ impl Replay {
                 row.date = uploaded_at
                     .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
                     .or(entry.date);
-                row.revision = 1;
                 self.objects.insert(object_id, row);
             }
             Op::FolderCommit {
@@ -576,7 +578,6 @@ impl Replay {
                 );
                 row.kind = FileKind::Folder;
                 row.date = entry.date;
-                row.revision = 1;
                 self.objects.insert(obj, row);
             }
             Op::Folder { obj, parent, name } => {
@@ -654,11 +655,15 @@ impl Replay {
             Op::Rename { obj, name } => {
                 if let Some(file) = self.objects.get_mut(&obj) {
                     file.name = name;
+                    // A rename is a revision, like the drive's own rows: the
+                    // next operation to name this object has to name the new one.
+                    file.revision += 1;
                 }
             }
             Op::Move { obj, parent } => {
                 if let Some(file) = self.objects.get_mut(&obj) {
                     file.parent = parent;
+                    file.revision += 1;
                 }
             }
             Op::Tomb { obj } | Op::Rmdir { obj } => {
@@ -698,6 +703,16 @@ impl Replay {
             } => {
                 let members = take_subtree(&mut self.objects, &obj);
                 if !members.is_empty() {
+                    // Hiding an object advances every row it hides, which is the
+                    // revision the restore or the purge that follows has to name
+                    // in its own compare-and-swap.
+                    let members = members
+                        .into_iter()
+                        .map(|mut member| {
+                            member.revision += 1;
+                            member
+                        })
+                        .collect();
                     self.trashed.insert(
                         obj,
                         TrashGroup {
@@ -716,6 +731,9 @@ impl Replay {
                             member.parent = parent.clone();
                             member.name = name.clone();
                         }
+                        // Coming back is another revision, on the same terms as
+                        // going away: a delete/restore cycle stays monotonic.
+                        member.revision += 1;
                         self.objects.insert(member.object_id.clone(), member);
                     }
                 }
@@ -769,26 +787,41 @@ impl Replay {
 
     /// Split the result into the live tree and the trash the drive itself holds.
     fn finish(mut self) -> (DriveContents, ReplayState) {
+        // Resolve the multipart groups into the objects that name them, live
+        // and trashed alike: a purge has to know which messages hold a trashed
+        // file's bytes before it can destroy them.
         for (object_id, uuid) in std::mem::take(&mut self.multipart) {
             let Some(found) = self.parts.get(&uuid) else {
-                continue;
-            };
-            let Some(file) = self.objects.get_mut(&object_id) else {
                 continue;
             };
             let mut ordered: Vec<&PartMessage> = found.iter().collect();
             ordered.sort_by_key(|part| part.index);
             let ids: Vec<i32> = ordered.iter().map(|part| part.message_id).collect();
             let kind = ordered.iter().find_map(|part| part.kind);
-            let total = ordered.iter().filter_map(|part| part.size).sum();
+            let total: i64 = ordered.iter().filter_map(|part| part.size).sum();
             let has_size = ordered.iter().any(|part| part.size.is_some());
-            if let Some(kind) = kind {
-                file.kind = kind;
+
+            let resolve = |file: &mut RemoteFile| {
+                if let Some(kind) = kind {
+                    file.kind = kind;
+                }
+                if file.size == 0 && has_size {
+                    file.size = total;
+                }
+                file.content = ContentRef::Parts(ids.clone());
+            };
+            if let Some(file) = self.objects.get_mut(&object_id) {
+                resolve(file);
             }
-            if file.size == 0 && has_size {
-                file.size = total;
+            for group in self.trashed.values_mut() {
+                if let Some(member) = group
+                    .members
+                    .iter_mut()
+                    .find(|member| member.object_id == object_id)
+                {
+                    resolve(member);
+                }
             }
-            file.content = ContentRef::Parts(ids);
         }
 
         // The state a later launch resumes from, taken once the multipart
@@ -1029,13 +1062,61 @@ pub async fn async_upload_file(
     Ok(())
 }
 
-pub async fn async_delete_file(
+/// The messages a purge deletes: the bodies of every file in the named trashed
+/// subtrees.
+///
+/// The original captures the same set into its hard-delete plan and destroys it
+/// from the client that started the purge. A legacy upload keeps its bytes in
+/// its own operation message, which is the drive's record that the object
+/// existed, so that one is left alone -- the plan leaves it alone too.
+pub(crate) fn purged_bodies(state: &ReplayState, roots: &[String]) -> Vec<i32> {
+    let mut bodies = BTreeSet::new();
+    for root in roots {
+        let Some(group) = state.trashed.get(root) else {
+            continue;
+        };
+        for member in &group.members {
+            match &member.content {
+                ContentRef::OpMessage => {}
+                ContentRef::Message(message_id) => {
+                    bodies.insert(*message_id);
+                }
+                ContentRef::Parts(parts) => bodies.extend(parts.iter().copied()),
+            }
+        }
+    }
+    bodies.into_iter().collect()
+}
+
+/// Publish one operation to the drive.
+///
+/// Every mutation in the original leaves the same trace: a message whose text is
+/// the formatted header. The projection reads it back on the next load, so this
+/// is the whole of the write path that is not about bytes.
+pub async fn async_send_op(client: &Client, peer_ref: PeerRef, op: &Op) -> Result<i32, String> {
+    let input = grammers_client::message::InputMessage::new().text(ops::format(op));
+    let message = client
+        .send_message(peer_ref, input)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(message.id())
+}
+
+/// Delete messages from the drive.
+///
+/// Only a purge does this, and only to the bodies a trashed file's bytes live
+/// in. An operation message is never deleted: it is the drive's own record that
+/// the object exists, or existed.
+pub async fn async_delete_messages(
     client: &Client,
     peer_ref: PeerRef,
-    message_id: i32,
+    message_ids: &[i32],
 ) -> Result<(), String> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
     client
-        .delete_messages(peer_ref, &[message_id])
+        .delete_messages(peer_ref, message_ids)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -1184,8 +1265,15 @@ pub fn load_drive(
 ) -> Result<(DriveContents, ReplayState, i32), String> {
     RT.block_on(async_load_drive(client, peer_ref, resume))
 }
-pub fn delete_file(client: &Client, peer_ref: PeerRef, message_id: i32) -> Result<(), String> {
-    RT.block_on(async_delete_file(client, peer_ref, message_id))
+pub fn send_op(client: &Client, peer_ref: PeerRef, op: &Op) -> Result<i32, String> {
+    RT.block_on(async_send_op(client, peer_ref, op))
+}
+pub fn delete_messages(
+    client: &Client,
+    peer_ref: PeerRef,
+    message_ids: &[i32],
+) -> Result<(), String> {
+    RT.block_on(async_delete_messages(client, peer_ref, message_ids))
 }
 pub fn upload_file(
     client: &Client,
@@ -1599,6 +1687,136 @@ mod tests {
         assert_eq!(file.content, ContentRef::Parts(vec![2, 1]));
         assert_eq!(file.kind, FileKind::Document);
         assert_eq!(file.size, 30);
+    }
+
+    /// A delete and the restore that undoes it each advance the object, because
+    /// the drive's own rows advance: the restore's compare-and-swap names the
+    /// revision its tombstone left behind, and the object comes back one past
+    /// that. Getting this wrong means the drive refuses the write in silence.
+    #[test]
+    fn a_delete_and_the_restore_that_undoes_it_advance_the_revision() {
+        let mut replay = Replay::default();
+        replay.apply(folder_commit(1, "d:home", "", "Home"), &no_media());
+        replay.apply(
+            file_commit(2, "d:home", "leaf.bin", 9, Some(9)),
+            &no_media(),
+        );
+        assert_eq!(
+            replay.objects.get("f:2").map(|file| file.revision),
+            Some(1),
+            "an object starts at revision 1, as the drive's rows do"
+        );
+
+        // The delete the port writes carries the revision it read.
+        replay.apply(
+            entry(3, ops::trash_op("f:2", 1, 1_700_000_000, 30 * 86_400)),
+            &no_media(),
+        );
+        let (contents, state) = replay.finish();
+        assert_eq!(
+            contents.trash[0].file.revision, 2,
+            "the tombstone is a revision of its own"
+        );
+
+        // And the restore carries the one the tombstone left.
+        let mut replay = Replay::from_state(state, false);
+        replay.apply(
+            entry(4, ops::restore_op("f:2", 2, "d:home", "leaf.bin")),
+            &no_media(),
+        );
+        let (contents, state) = replay.finish();
+        assert_eq!(find(&contents, "f:2").revision, 3);
+        assert_eq!(find(&contents, "f:2").parent, "d:home");
+        assert!(contents.trash.is_empty());
+
+        // A purge is written against the same revision and leaves nothing.
+        let mut replay = Replay::from_state(state, false);
+        replay.apply(
+            entry(5, ops::trash_op("f:2", 3, 1_700_000_100, 30 * 86_400)),
+            &no_media(),
+        );
+        let (contents, state) = replay.finish();
+        assert_eq!(contents.trash[0].file.revision, 4);
+        let mut replay = Replay::from_state(state, false);
+        replay.apply(entry(6, ops::purge_op("f:2", 4)), &no_media());
+        let (contents, state) = replay.finish();
+        assert!(contents.trash.is_empty());
+        assert!(
+            !state.objects.contains_key("f:2"),
+            "the file is gone for good"
+        );
+    }
+
+    /// Renaming or moving a file advances it, as it does the drive's own
+    /// namespace rows: the next operation to name the object has to name the
+    /// name's own revision.
+    #[test]
+    fn a_rename_and_a_move_advance_the_revision() {
+        let mut replay = Replay::default();
+        replay.apply(file_commit(1, "", "leaf.bin", 9, Some(9)), &no_media());
+        replay.apply(
+            entry(
+                2,
+                Op::Rename {
+                    obj: "f:1".to_string(),
+                    name: "renamed.bin".to_string(),
+                },
+            ),
+            &no_media(),
+        );
+        let (contents, state) = replay.finish();
+        assert_eq!(find(&contents, "f:1").revision, 2);
+
+        let mut replay = Replay::from_state(state, false);
+        replay.apply(
+            entry(
+                3,
+                Op::Move {
+                    obj: "f:1".to_string(),
+                    parent: "d:home".to_string(),
+                },
+            ),
+            &no_media(),
+        );
+        let (contents, _) = replay.finish();
+        let file = find(&contents, "f:1");
+        assert_eq!(file.revision, 3);
+        assert_eq!(file.parent, "d:home");
+        assert_eq!(file.name, "renamed.bin");
+    }
+
+    /// A purge destroys the messages a trashed file's bytes live in, and leaves
+    /// the operation messages alone: they are the drive's own record.
+    #[test]
+    fn a_purge_names_the_bodies_it_destroys() {
+        let mut replay = Replay::default();
+        replay.apply(folder_commit(1, "d:home", "", "Home"), &no_media());
+        // A file whose bytes live on another message, and one whose bytes are
+        // its own operation message.
+        replay.apply(
+            file_commit(2, "d:home", "committed.bin", 9, Some(9)),
+            &no_media(),
+        );
+        replay.apply(
+            file_commit(3, "d:home", "legacy.bin", 0, Some(4)),
+            &no_media(),
+        );
+        let (_, state) = replay.finish();
+
+        let mut replay = Replay::from_state(state, false);
+        replay.apply(entry(4, ops::trash_op("d:home", 1, 100, 200)), &no_media());
+        let (_, state) = replay.finish();
+
+        let bodies = purged_bodies(&state, &["d:home".to_string()]);
+        assert_eq!(
+            bodies,
+            vec![9],
+            "the body message goes; the operation messages stay"
+        );
+        assert!(
+            purged_bodies(&state, &["f:2".to_string()]).is_empty(),
+            "only a trashed object is purgeable"
+        );
     }
 
     /// A replacement points the row at the new body and bumps its revision.

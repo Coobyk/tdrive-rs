@@ -30,9 +30,11 @@ use crate::crypto;
 use crate::format::{entry_origin, human_size, purge_countdown, short_date};
 use crate::models::{
     AppState, ContentRef, Drive, DriveCandidate, DriveKind, FileKind, LocalState, LoginStep,
-    RemoteFile, SortKey, SortState, TrashEntry, ViewMode,
+    PURGE_WINDOW_DAYS, RemoteFile, SortKey, SortState, TrashEntry, ViewMode,
 };
+use crate::ops::{self, Op};
 use crate::tele;
+use crate::tele::DriveContents;
 use crate::theme;
 
 type TeleClient = grammers_client::Client;
@@ -1226,13 +1228,15 @@ impl TDriveView {
                                     // A reload is the way back to the truth the
                                     // drive itself holds: drop the snapshot so
                                     // the whole history is read again, and
-                                    // deletions made elsewhere show up.
+                                    // deletions made elsewhere show up. It keeps
+                                    // the folder on screen, as the original's
+                                    // reload does.
                                     if let Some(drive) =
                                         reload_view.read(cx).state.drives.get(index)
                                     {
                                         cache::invalidate(drive.id);
                                     }
-                                    open_drive_clicked(reload_view.clone(), index, cx);
+                                    spawn_load_drive(reload_view.clone(), index, true, cx);
                                 }
                             })
                     }))
@@ -2161,18 +2165,15 @@ fn empty_trash_button(view: Entity<TDriveView>, armed: bool) -> AnyElement {
                 .border_color(theme::danger())
         })
         .on_click(move |_, _window, cx| {
-            button_view.update(cx, |this, cx| {
-                if this.state.confirm_empty_trash {
-                    let count = this.state.trash.len();
-                    this.state.trash.clear();
-                    this.state.confirm_empty_trash = false;
-                    this.state.pending_purge = None;
-                    this.state.status = format!("Emptied the trash ({count} items)");
-                } else {
+            let armed = button_view.read(cx).state.confirm_empty_trash;
+            if armed {
+                empty_trash(button_view.clone(), cx);
+            } else {
+                button_view.update(cx, |this, cx| {
                     this.state.confirm_empty_trash = true;
-                }
-                cx.notify();
-            });
+                    cx.notify();
+                });
+            }
         })
         .child(glyph(IconName::Trash, 15., theme::danger()))
         .child(label)
@@ -2794,7 +2795,50 @@ fn create_personal_drive(view: Entity<TDriveView>, cx: &mut App) {
 ///
 /// Must not be called from inside a `view.update` closure; interrupt the
 /// closure and let it return first.
-fn spawn_open_drive_inner(view: Entity<TDriveView>, index: usize, cx: &mut App) {
+/// Put a freshly read drive on screen: its files, its trash and its vault.
+///
+/// Opening a drive and re-reading one after a write both draw these three
+/// things, so they share this; the breadcrumb, the view and the key belong to
+/// whoever asked for the read.
+fn apply_contents(state: &mut AppState, title: &str, result: Result<DriveContents, String>) {
+    state.files_loading = false;
+    match result {
+        Ok(contents) => {
+            let count = contents.files.len();
+            state.files = contents.files;
+            // The drive's own trash is part of what was read, so the Trash view
+            // shows what the *drive* deleted, not only what this session did.
+            state.trash = contents
+                .trash
+                .into_iter()
+                .map(|entry| TrashEntry {
+                    deleted_at: DateTime::from_timestamp(entry.deleted_at, 0)
+                        .unwrap_or_else(Utc::now),
+                    origin: title.to_string(),
+                    file: entry.file,
+                })
+                .collect();
+            // The key belongs to the drive, so a drive that has one asks for
+            // it; one that does not never will.
+            state.set_vault(contents.vault);
+            state.touch();
+            state.status = format!("{count} items in {title}");
+        }
+        Err(message) => {
+            state.status = "Could not open drive".to_string();
+            state.error = Some(message);
+        }
+    }
+}
+
+/// Open a drive, or re-read the one already open.
+///
+/// `refresh` keeps the breadcrumb, the view and the unlock key the user already
+/// has, and is what a write asks for afterwards: the projection in the drive is
+/// the authority on what an operation did, so the list is rebuilt from it
+/// rather than patched here, and a write the drive refused cannot leave the
+/// screen claiming otherwise.
+fn spawn_load_drive(view: Entity<TDriveView>, index: usize, refresh: bool, cx: &mut App) {
     let (client, peer_ref, title, drive_id) = {
         let this = view.read(cx);
         let Some(drive) = this.state.drives.get(index) else {
@@ -2811,26 +2855,34 @@ fn spawn_open_drive_inner(view: Entity<TDriveView>, index: usize, cx: &mut App) 
     // Without a session there is nothing to read; in demo mode the seeded list
     // already stands in for the drive, so switching still works.
     let Some(client) = client else {
-        view.update(cx, |this, cx| {
-            this.state.open_drive(index);
-            this.state.set_view(ViewMode::Drive);
-            this.state.files_loading = false;
-            this.state.status = format!("{title} (demo data)");
-            cx.notify();
-        });
+        if !refresh {
+            view.update(cx, |this, cx| {
+                this.state.open_drive(index);
+                this.state.set_view(ViewMode::Drive);
+                this.state.files_loading = false;
+                this.state.status = format!("{title} (demo data)");
+                cx.notify();
+            });
+        }
         return;
     };
 
     view.update(cx, |this, cx| {
-        this.state.open_drive(index);
-        this.state.set_view(ViewMode::Drive);
+        if !refresh {
+            this.state.open_drive(index);
+            this.state.set_view(ViewMode::Drive);
+            this.state.files.clear();
+            this.state.vault = None;
+        }
         this.state.pending_delete = None;
         this.state.pending_purge = None;
         this.state.confirm_empty_trash = false;
-        this.state.files.clear();
-        this.state.vault = None;
         this.state.files_loading = true;
-        this.state.status = format!("Opening {title}...");
+        this.state.status = if refresh {
+            "Reloading...".to_string()
+        } else {
+            format!("Opening {title}...")
+        };
         this.state.error = None;
         cx.notify();
     });
@@ -2869,32 +2921,110 @@ fn spawn_open_drive_inner(view: Entity<TDriveView>, index: usize, cx: &mut App) 
                 if this.state.active_dialog().map(|d| d.id) != Some(drive_id) {
                     return;
                 }
-                this.state.files_loading = false;
+                apply_contents(&mut this.state, &title, result);
+                cx.notify();
+            });
+        });
+    })
+    .detach();
+}
+
+fn spawn_open_drive_inner(view: Entity<TDriveView>, index: usize, cx: &mut App) {
+    spawn_load_drive(view, index, false, cx);
+}
+
+/// Write operations to the active drive, then re-read it.
+///
+/// Every mutation in the original leaves the same trace: an operation message
+/// whose header the projection reads back. Nothing is applied to the list here,
+/// so what is on screen afterwards is what the drive actually holds.
+///
+/// `purge` names trashed objects whose bytes should be destroyed as well, which
+/// is the second half of a purge: the marker hides the namespace and the same
+/// client deletes the bodies, exactly as the original's hard-delete job does.
+fn spawn_write(
+    view: Entity<TDriveView>,
+    ops: Vec<Op>,
+    purge: Vec<String>,
+    done: String,
+    cx: &mut App,
+) {
+    let (client, peer_ref, drive_id, title) = {
+        let this = view.read(cx);
+        let Some(dialog) = this.state.active_dialog() else {
+            return;
+        };
+        (
+            this.state.tele.clone(),
+            dialog.peer_ref,
+            dialog.id,
+            dialog.title.clone(),
+        )
+    };
+
+    view.update(cx, |this, cx| {
+        this.state.pending_delete = None;
+        this.state.pending_purge = None;
+        this.state.confirm_empty_trash = false;
+        this.state.files_loading = true;
+        this.state.status = "Saving...".to_string();
+        this.state.error = None;
+        cx.notify();
+    });
+
+    // Without a session there is nothing to write to. The demo walks its own
+    // local half of the flow before it gets here.
+    let Some(client) = client else {
+        return;
+    };
+
+    // The operations about to be written are messages the drive has not
+    // replayed yet, so the read starts from the snapshot and picks them up.
+    let resume = cache::load(drive_id).map(|snapshot| (snapshot.newest_message_id, snapshot.state));
+
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_spawn({
+                let client = client.clone();
+                async move {
+                    for op in &ops {
+                        tele::send_op(&client, peer_ref, op)?;
+                    }
+                    if !purge.is_empty() {
+                        // The bodies a purge destroys are read from the snapshot
+                        // the way the drive reads them from its own plan: the
+                        // messages the trashed files' bytes live in.
+                        let bodies = cache::load(drive_id)
+                            .map(|snapshot| tele::purged_bodies(&snapshot.state, &purge))
+                            .unwrap_or_default();
+                        tele::delete_messages(&client, peer_ref, &bodies)?;
+                    }
+                    let (contents, state, newest) = tele::load_drive(&client, peer_ref, resume)?;
+                    let _ = cache::save(&cache::Snapshot {
+                        version: cache::VERSION,
+                        drive_id,
+                        newest_message_id: newest,
+                        state,
+                    });
+                    Ok::<_, String>(contents)
+                }
+            })
+            .await;
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                // The row may have moved, or the user may have moved to another
+                // drive, while the request was in flight.
+                if this.state.active_dialog().map(|d| d.id) != Some(drive_id) {
+                    return;
+                }
                 match result {
                     Ok(contents) => {
-                        let count = contents.files.len();
-                        this.state.files = contents.files;
-                        // The drive's own trash is part of what was read, so
-                        // the Trash view shows what the *drive* deleted, not
-                        // only what this session did.
-                        this.state.trash = contents
-                            .trash
-                            .into_iter()
-                            .map(|entry| TrashEntry {
-                                deleted_at: DateTime::from_timestamp(entry.deleted_at, 0)
-                                    .unwrap_or_else(Utc::now),
-                                origin: title.clone(),
-                                file: entry.file,
-                            })
-                            .collect();
-                        // The key belongs to the drive, so a drive that has
-                        // one asks for it; one that does not never will.
-                        this.state.set_vault(contents.vault);
-                        this.state.touch();
-                        this.state.status = format!("{count} items in {title}");
+                        apply_contents(&mut this.state, &title, Ok(contents));
+                        this.state.status = done;
                     }
                     Err(message) => {
-                        this.state.status = "Could not open drive".to_string();
+                        this.state.files_loading = false;
+                        this.state.status = "Could not save".to_string();
                         this.state.error = Some(message);
                     }
                 }
@@ -3095,7 +3225,10 @@ fn spawn_upload(view: Entity<TDriveView>, cx: &mut App) {
             })
         });
         if let Some(index) = to_reload {
-            cx.update(|cx| spawn_open_drive_inner(view, index, cx));
+            // The upload stays where it was put: the list is re-read rather
+            // than reopened, so the folder on screen is still the one the file
+            // landed in.
+            cx.update(|cx| spawn_load_drive(view, index, true, cx));
         }
     })
     .detach();
@@ -3205,115 +3338,211 @@ fn move_file_to_trash(state: &mut AppState, message_id: i32, origin: &str) -> Op
     Some(entry.file.name)
 }
 
+/// Delete a row: the drive's own trash, not a Telegram deletion.
+///
+/// The original publishes a trash operation and stops, which is what leaves the
+/// file restorable for its retention window; the bytes stay where they are until
+/// the object is purged. Deleting the messages instead, as this port used to,
+/// destroys a file the user can still see in the trash.
 fn spawn_delete(view: Entity<TDriveView>, index: usize, cx: &mut App) {
-    let (client, peer_ref, dialog_id, title, message_id, name, demo) = {
+    let (client, file, demo) = {
         let this = view.read(cx);
-        let Some(dialog) = this.state.active_dialog().cloned() else {
+        let Some(file) = this.state.files.get(index).cloned() else {
             return;
         };
-        let Some(file) = this.state.files.get(index) else {
-            return;
-        };
-        (
-            this.state.tele.clone(),
-            dialog.peer_ref,
-            dialog.id,
-            dialog.title.clone(),
-            file.message_id,
-            file.name.clone(),
-            this.state.demo,
-        )
+        (this.state.tele.clone(), file, this.state.demo)
     };
-
-    view.update(cx, |this, cx| {
-        this.state.pending_delete = None;
-        this.state.status = "Deleting...".to_string();
-        this.state.error = None;
-        cx.notify();
-    });
 
     // Without a session there is nothing to delete on Telegram, but the demo
     // still walks the local half of the flow so the trash is reachable.
-    let Some(client) = client else {
+    if client.is_none() {
         if demo {
             view.update(cx, |this, cx| {
-                this.state.status = match move_file_to_trash(&mut this.state, message_id, &title) {
-                    Some(name) => format!("Moved {name} to trash"),
-                    None => "Nothing to delete".to_string(),
-                };
+                let title = this
+                    .state
+                    .active_dialog()
+                    .map(|drive| drive.title.clone())
+                    .unwrap_or_default();
+                this.state.pending_delete = None;
+                this.state.status =
+                    match move_file_to_trash(&mut this.state, file.message_id, &title) {
+                        Some(name) => format!("Moved {name} to trash"),
+                        None => "Nothing to delete".to_string(),
+                    };
                 cx.notify();
             });
         }
         return;
-    };
+    }
 
-    cx.spawn(async move |cx| {
-        let result = cx
-            .background_spawn(async move { tele::delete_file(&client, peer_ref, message_id) })
-            .await;
-        cx.update(|cx| {
-            view.update(cx, |this, cx| {
-                // The row may have moved, or the user may have moved to another
-                // drive, while the request was in flight.
-                if this.state.active_dialog().map(|d| d.id) != Some(dialog_id) {
-                    return;
-                }
-                match result {
-                    Ok(()) => {
-                        // Deletion is a move to the trash, so the file keeps its
-                        // name and size there until it is purged.
-                        let object_id = this
-                            .state
-                            .files
-                            .iter()
-                            .find(|file| file.message_id == message_id)
-                            .map(|file| file.object_id.clone());
-                        move_file_to_trash(&mut this.state, message_id, &title);
-                        // The message is gone from the drive, and a message
-                        // that is gone is invisible to a resume watermark: take
-                        // the object out of the snapshot too, or the next launch
-                        // shows a file the drive no longer has.
-                        if let Some(object_id) = object_id {
-                            cache::forget_object(dialog_id, &object_id);
-                        }
-                        this.state.status = format!("Moved {name} to trash");
-                    }
-                    Err(message) => this.state.error = Some(message),
-                }
-                cx.notify();
-            });
-        });
-    })
-    .detach();
+    let op = ops::trash_op(
+        &file.object_id,
+        file.revision,
+        Utc::now().timestamp(),
+        PURGE_WINDOW_DAYS * 86_400,
+    );
+    let name = file.name.clone();
+    spawn_write(
+        view,
+        vec![op],
+        Vec::new(),
+        format!("Moved {name} to trash"),
+        cx,
+    );
 }
 
 /// Put a trashed item back in the drive it came from.
 ///
 /// This port's trash is session-scoped: nothing was sent to Telegram to move
 /// the item out of the drive, so restoring is a local move back into the list.
+/// Put a trashed entry back, as the drive's own restore operation.
+///
+/// The folder it was deleted from may have gone since, in which case the drive
+/// rehomes it at the root, and the name it had may be taken by now, in which
+/// case a free one is chosen. Both are written into the operation, because the
+/// drive cannot guess what this client meant.
 fn restore_trash_entry(view: Entity<TDriveView>, index: usize, cx: &mut App) {
-    view.update(cx, |this, cx| {
-        if index < this.state.trash.len() {
-            let entry = this.state.trash.remove(index);
-            this.state.status = format!("Restored {}", entry.file.name);
-            this.state.files.push(entry.file);
-            this.state.touch();
+    let (client, entry, parent, name, demo) = {
+        let this = view.read(cx);
+        let Some(entry) = this.state.trash.get(index).cloned() else {
+            return;
+        };
+        let mut parent = entry.file.parent.clone();
+        if !parent.is_empty()
+            && !this
+                .state
+                .files
+                .iter()
+                .any(|file| file.is_folder() && file.object_id == parent)
+        {
+            parent.clear();
         }
-        this.state.pending_purge = None;
-        cx.notify();
-    });
+        let name = this
+            .state
+            .free_sibling_name(&parent, &entry.file.name, entry.file.is_folder());
+        (
+            this.state.tele.clone(),
+            entry,
+            parent,
+            name,
+            this.state.demo,
+        )
+    };
+
+    if client.is_none() {
+        // The demo has no drive to restore into, so the row returns locally.
+        if demo {
+            view.update(cx, |this, cx| {
+                if index < this.state.trash.len() {
+                    let entry = this.state.trash.remove(index);
+                    this.state.status = format!("Restored {}", entry.file.name);
+                    this.state.files.push(entry.file);
+                    this.state.touch();
+                }
+                this.state.pending_purge = None;
+                cx.notify();
+            });
+        }
+        return;
+    }
+
+    let op = ops::restore_op(&entry.file.object_id, entry.file.revision, &parent, &name);
+    spawn_write(
+        view,
+        vec![op],
+        Vec::new(),
+        format!("Restored {}", entry.file.name),
+        cx,
+    );
 }
 
 /// Drop a trashed item for good.
+///
+/// The marker hides it from the drive for ever, and the bodies its bytes live in
+/// are deleted with it. Purging is the only path here that deletes Telegram
+/// messages, which is why the drive requires the object to have been trashed
+/// first.
 fn purge_trash_entry(view: Entity<TDriveView>, index: usize, cx: &mut App) {
-    view.update(cx, |this, cx| {
-        if index < this.state.trash.len() {
-            let entry = this.state.trash.remove(index);
-            this.state.status = format!("Deleted {} permanently", entry.file.name);
+    let (client, entry, demo) = {
+        let this = view.read(cx);
+        let Some(entry) = this.state.trash.get(index).cloned() else {
+            return;
+        };
+        (this.state.tele.clone(), entry, this.state.demo)
+    };
+
+    if client.is_none() {
+        if demo {
+            view.update(cx, |this, cx| {
+                if index < this.state.trash.len() {
+                    let entry = this.state.trash.remove(index);
+                    this.state.status = format!("Deleted {} permanently", entry.file.name);
+                }
+                this.state.pending_purge = None;
+                cx.notify();
+            });
         }
-        this.state.pending_purge = None;
-        cx.notify();
-    });
+        return;
+    }
+
+    let op = ops::purge_op(&entry.file.object_id, entry.file.revision);
+    spawn_write(
+        view,
+        vec![op],
+        vec![entry.file.object_id.clone()],
+        format!("Deleted {} permanently", entry.file.name),
+        cx,
+    );
+}
+
+/// Purge everything in the trash, one operation per object.
+///
+/// Each entry is its own operation, as it is in the original's retention sweep,
+/// so one that fails leaves the rest purged instead of one all-or-nothing
+/// request that a single refusal would undo.
+fn empty_trash(view: Entity<TDriveView>, cx: &mut App) {
+    let (client, entries, demo) = {
+        let this = view.read(cx);
+        (
+            this.state.tele.clone(),
+            this.state.trash.clone(),
+            this.state.demo,
+        )
+    };
+    if entries.is_empty() {
+        return;
+    }
+
+    if client.is_none() {
+        if demo {
+            view.update(cx, |this, cx| {
+                let count = this.state.trash.len();
+                this.state.trash.clear();
+                this.state.confirm_empty_trash = false;
+                this.state.pending_purge = None;
+                this.state.status = format!("Emptied the trash ({count} items)");
+                cx.notify();
+            });
+        }
+        return;
+    }
+
+    let ops = entries
+        .iter()
+        .map(|entry| ops::purge_op(&entry.file.object_id, entry.file.revision))
+        .collect();
+    let purge = entries
+        .iter()
+        .map(|entry| entry.file.object_id.clone())
+        .collect();
+    let count = entries.len();
+    spawn_write(
+        view,
+        ops,
+        purge,
+        format!("Emptied the trash ({count} items)"),
+        cx,
+    );
 }
 
 fn download_dir() -> PathBuf {

@@ -1066,6 +1066,74 @@ pub fn format_file(parent: &str, name: &str, size: i64, uploaded_at: i64) -> Str
     })
 }
 
+/// The op id the original's `DeterministicOpID` writes for a trash, restore or
+/// purge: the purpose, a hyphen, and the first 16 bytes of a SHA-256 over a
+/// domain-separated identity.
+///
+/// The identity includes the revision the writer saw, so a delete is a
+/// different operation from the restore that follows it, and re-running one
+/// produces the same id rather than a second entry.
+pub fn deterministic_op_id(purpose: &str, object_id: &str, revision: i64) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"tdrive.trash.v1\0");
+    hasher.update(purpose.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(object_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(revision.to_string().as_bytes());
+    let digest = hasher.finalize();
+
+    let mut out = String::with_capacity(purpose.len() + 1 + 32);
+    out.push_str(purpose);
+    out.push('-');
+    for byte in &digest[..16] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// A delete: the original's `projection.TrashOp`, which hides the object and
+/// its subtree without touching Telegram.
+///
+/// `revision` is the revision the writer saw, which the drive compares against
+/// its own before it applies anything.
+pub fn trash_op(object_id: &str, revision: i64, now: i64, retention_secs: i64) -> Op {
+    Op::Trash {
+        op_id: deterministic_op_id("trash", object_id, revision),
+        obj: object_id.to_string(),
+        expected_revision: revision,
+        deleted_at: now,
+        purge_after: now + retention_secs,
+    }
+}
+
+/// A restore: the original's `projection.RestoreOp`, which reopens a trashed
+/// object under an explicit parent and name. The original home may be gone, and
+/// the name may be taken by the time it comes back, so both are written out
+/// rather than inferred.
+pub fn restore_op(object_id: &str, revision: i64, parent: &str, name: &str) -> Op {
+    Op::Untrash {
+        op_id: deterministic_op_id("restore", object_id, revision),
+        obj: object_id.to_string(),
+        parent: parent.to_string(),
+        name: name.to_string(),
+        expected_revision: revision,
+    }
+}
+
+/// A purge: the original's `projection.HardDeleteOp`, which removes a trashed
+/// object for good. Its bodies are deleted separately, because the marker only
+/// describes the namespace.
+pub fn purge_op(object_id: &str, revision: i64) -> Op {
+    Op::HardDelete {
+        op_id: deterministic_op_id("purge", object_id, revision),
+        obj: object_id.to_string(),
+        expected_revision: revision,
+    }
+}
+
 /// `f:<v>`: build a file object id, matching Go's `FileIDPrefix`.
 pub fn file_obj_id(v: &str) -> String {
     format!("{FILE_ID_PREFIX}{v}")
@@ -2358,5 +2426,106 @@ mod tests {
     #[test]
     fn file_replace_only_targets_files() {
         malformed("TDX1|t=freplace|v=1|oid=op|obj=d:1|rev=1|cmid=2|retain=3");
+    }
+
+    /// The op ids a delete, a restore and a purge carry are the original's own
+    /// values for the same inputs, down to the byte: the digest is over a
+    /// domain-separated identity, and the golden values here were computed from
+    /// the original's `DeterministicOpID` rather than from this code.
+    #[test]
+    fn a_trash_op_id_is_the_one_the_original_writes() {
+        assert_eq!(
+            deterministic_op_id("trash", "f:1", 1),
+            "trash-56eac129eb0efaa44de19bc662fff63c"
+        );
+        assert_eq!(
+            deterministic_op_id("restore", "d:zeta", 3),
+            "restore-edeb90fc68b4eabd8840e562d871fb7a"
+        );
+        assert_eq!(
+            deterministic_op_id("purge", "f:42", 7),
+            "purge-0f8c0318044033a48bcde27e1e5804c8"
+        );
+        // The revision is part of the identity: the delete and the restore that
+        // undoes it are never the same operation.
+        assert_ne!(
+            deterministic_op_id("trash", "f:1", 1),
+            deterministic_op_id("trash", "f:1", 2)
+        );
+    }
+
+    /// A delete carries the retention window it was written with, and the
+    /// restore and purge that follow name the revision they expect to find.
+    #[test]
+    fn the_delete_restore_and_purge_operations_round_trip() {
+        let trash = trash_op("f:1", 2, 1_700_000_000, 30 * 86_400);
+        assert_eq!(trash, op(&format(&trash)));
+        match &trash {
+            Op::Trash {
+                op_id,
+                obj,
+                expected_revision,
+                deleted_at,
+                purge_after,
+            } => {
+                assert_eq!(op_id, &deterministic_op_id("trash", "f:1", 2));
+                assert_eq!(obj, "f:1");
+                assert_eq!(*expected_revision, 2);
+                assert_eq!(*deleted_at, 1_700_000_000);
+                assert_eq!(*purge_after, 1_700_000_000 + 30 * 86_400);
+            }
+            other => panic!("trash_op built {other:?}"),
+        }
+
+        let restore = restore_op("d:zeta", 3, "d:home", "Ringtones (2)");
+        assert_eq!(restore, op(&format(&restore)));
+        match &restore {
+            Op::Untrash {
+                obj,
+                parent,
+                name,
+                expected_revision,
+                ..
+            } => {
+                assert_eq!(obj, "d:zeta");
+                assert_eq!(parent, "d:home");
+                assert_eq!(name, "Ringtones (2)");
+                assert_eq!(*expected_revision, 3);
+            }
+            other => panic!("restore_op built {other:?}"),
+        }
+
+        let purge = purge_op("f:42", 7);
+        assert_eq!(purge, op(&format(&purge)));
+        match &purge {
+            Op::HardDelete {
+                obj,
+                expected_revision,
+                ..
+            } => {
+                assert_eq!(obj, "f:42");
+                assert_eq!(*expected_revision, 7);
+            }
+            other => panic!("purge_op built {other:?}"),
+        }
+    }
+
+    /// The headers a delete, a restore and a purge put in the drive, pinned as
+    /// text: the drive's own reader is the only consumer, and a field it does
+    /// not expect is a write that does nothing.
+    #[test]
+    fn the_management_headers_are_written_the_way_the_drive_reads_them() {
+        assert_eq!(
+            format(&trash_op("f:2", 1, 1_700_000_000, 30 * 86_400)),
+            "TDX1|t=trash|v=1|oid=trash-c9908488a3b8821148497b9817de1505|obj=f:2|rev=1|del=1700000000|purge=1702592000"
+        );
+        assert_eq!(
+            format(&restore_op("f:2", 2, "", "leaf.bin")),
+            "TDX1|t=untrash|v=1|oid=restore-3f7ed584569b532d578f0e7e98de45c4|obj=f:2|p=|n=leaf.bin|rev=2"
+        );
+        assert_eq!(
+            format(&purge_op("f:2", 4)),
+            "TDX1|t=harddel|v=1|oid=purge-fe467995d69f3f41ae7b23eb64968cc4|obj=f:2|rev=4"
+        );
     }
 }
