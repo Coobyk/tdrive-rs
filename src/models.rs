@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -256,6 +257,11 @@ impl Default for ViewMode {
 /// trash reports a countdown against this deadline, so it is the number the
 /// port needs to reproduce the same wording.
 pub const PURGE_WINDOW_DAYS: i64 = 30;
+
+/// How many matches the search list draws per kind. The original's
+/// `projection.Search` clamps its limit the same way, folders and files each
+/// counted separately.
+pub const SEARCH_LIMIT: usize = 200;
 
 /// An item in the trash: the file it came from, where it came from, and when it
 /// was deleted. [`TrashEntry::purge_after`] is derived so the countdown has a
@@ -560,8 +566,21 @@ impl AppState {
     pub fn set_query(&mut self, query: String) {
         if self.query != query {
             self.query = query;
+            // A search spans the whole drive, so it is a file-list view.
+            // Leaving Photos or the trash is what the original's
+            // `runGlobalSearch` does before it draws results, rather than
+            // filtering a gallery or drawing live files under a trash heading.
+            if self.searching() && self.view != ViewMode::Drive {
+                self.view = ViewMode::Drive;
+            }
             self.touch();
         }
+    }
+
+    /// Whether the search box holds a query, which is what turns the list from
+    /// one folder's contents into the drive's matches.
+    pub fn searching(&self) -> bool {
+        !self.query.trim().is_empty()
     }
 
     pub fn toggle_sort(&mut self, key: SortKey) {
@@ -666,7 +685,114 @@ impl AppState {
         if self.trash_mode() {
             return Vec::new();
         }
-        self.order(&self.files, self.photos_only())
+        if self.searching() {
+            return self.search_results();
+        }
+        self.order(&self.files, Some(self.current_folder()), self.photos_only())
+    }
+
+    /// Every entry in the drive whose name matches the search box, in the
+    /// original's shape: matching folders first, then matching files, each
+    /// capped the way its SQL queries cap theirs.
+    ///
+    /// The original searches its projection, which spans the whole channel
+    /// rather than the folder on screen, so a search here does too: a result
+    /// can live anywhere, and the list shows where in place of its date. The
+    /// order within each half is the list's own sort rather than the fixed
+    /// order the original's two queries happen to return, so the column
+    /// headers keep working while a search is up.
+    fn search_results(&self) -> Vec<usize> {
+        let ordered = self.order(&self.files, None, false);
+        let split = ordered.partition_point(|&index| self.files[index].is_folder());
+        let mut results: Vec<usize> = ordered[..split]
+            .iter()
+            .copied()
+            .take(SEARCH_LIMIT)
+            .collect();
+        results.extend(ordered[split..].iter().copied().take(SEARCH_LIMIT));
+        results
+    }
+
+    /// Folders by object id, as parent and name, which is what a search
+    /// result's path is built from. One pass over the drive, so building it
+    /// along with the rows is cheap even at six figures of files.
+    pub fn folder_index(&self) -> BTreeMap<String, (String, String)> {
+        self.files
+            .iter()
+            .filter(|file| file.is_folder())
+            .map(|file| {
+                (
+                    file.object_id.clone(),
+                    (file.parent.clone(), file.name.clone()),
+                )
+            })
+            .collect()
+    }
+
+    /// The path a search result shows in place of its date: the chain of
+    /// folders above it under the drive's name, as the original's
+    /// `buildFolderPathLazy` writes it ("My Drive / Photos / 2026").
+    ///
+    /// A result directly in the drive is "My Drive", and a missing or looping
+    /// parent link ends the walk rather than running on.
+    pub fn folder_path(folders: &BTreeMap<String, (String, String)>, folder_id: &str) -> String {
+        let mut names: Vec<&str> = Vec::new();
+        let mut visited: BTreeSet<&str> = BTreeSet::new();
+        let mut current = folder_id;
+        while !current.is_empty() && visited.insert(current) {
+            let Some((parent, name)) = folders.get(current) else {
+                break;
+            };
+            if !name.trim().is_empty() {
+                names.push(name.as_str());
+            }
+            current = parent.as_str();
+        }
+        if names.is_empty() {
+            return "My Drive".to_string();
+        }
+        names.reverse();
+        format!("My Drive / {}", names.join(" / "))
+    }
+
+    /// Select the row for one object in whatever list is on screen now.
+    ///
+    /// Opening a search result lands in the folder it lives in, where the row's
+    /// index is not the one the result had: this is how the file that was
+    /// double-clicked stays marked after the list changes under it.
+    pub fn select_object(&mut self, object_id: &str) {
+        let rows = self.visible_files();
+        self.selected_file = rows
+            .into_iter()
+            .find(|&index| self.files[index].object_id == object_id);
+    }
+
+    /// Leaving a search by opening one of its results: the folder can be
+    /// anywhere in the drive, so the breadcrumb is rebuilt from the parent
+    /// links rather than walked forward from the root. The result's own folder
+    /// becomes the one on screen, exactly as the original's
+    /// `setFolderPathAbsolute` does.
+    pub fn reveal_folder(&mut self, folder_id: &str, title: &str) {
+        let index = self.folder_index();
+        let mut chain: Vec<(String, String)> = Vec::new();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut current = folder_id.to_string();
+        while !current.is_empty() && visited.insert(current.clone()) {
+            let Some((parent, name)) = index.get(&current) else {
+                break;
+            };
+            chain.push((current.clone(), name.clone()));
+            current = parent.clone();
+        }
+        chain.reverse();
+
+        self.folder = vec![Crumb::root(title)];
+        for (id, name) in chain {
+            self.folder.push(Crumb { id, name });
+        }
+        self.query.clear();
+        self.selected_file = None;
+        self.touch();
     }
 
     /// Trash rows for the current search and sort. The Date column reports the
@@ -704,20 +830,20 @@ impl AppState {
         indices
     }
 
-    /// Filter and order a folder's entries, keeping the original ordering when
-    /// the search box and Photos mode are both off.
+    /// Filter and order the entries the list draws, keeping the original
+    /// ordering when the search box and Photos mode are both off.
     ///
-    /// Folders lead files, as they do in the original, and the whole pass is
-    /// one allocation per row rather than one per comparison: a folder can hold
-    /// a hundred thousand entries and this runs on every keystroke in the
-    /// search box.
-    fn order(&self, files: &[RemoteFile], images_only: bool) -> Vec<usize> {
+    /// `folder` is the folder whose entries are wanted, or `None` for a search,
+    /// which spans the drive. Folders lead files, as they do in the original,
+    /// and the whole pass is one allocation per row rather than one per
+    /// comparison: a folder can hold a hundred thousand entries and this runs
+    /// on every keystroke in the search box.
+    fn order(&self, files: &[RemoteFile], folder: Option<&str>, images_only: bool) -> Vec<usize> {
         let query = self.query.trim().to_lowercase();
-        let folder = self.current_folder();
         let mut keyed: Vec<(bool, String, usize)> = files
             .iter()
             .enumerate()
-            .filter(|(_, f)| f.parent == folder)
+            .filter(|(_, f)| folder.is_none_or(|id| f.parent == id))
             .filter(|(_, f)| !images_only || f.kind == FileKind::Image)
             .filter(|(_, f)| query.is_empty() || f.name.to_lowercase().contains(&query))
             .map(|(i, f)| (!f.is_folder(), f.name.to_lowercase(), i))
@@ -1089,6 +1215,169 @@ mod tests {
         assert_eq!(state.visible_files(), vec![1, 2, 0], "ascending by size");
         state.toggle_sort(SortKey::Size);
         assert_eq!(state.visible_files(), vec![0, 2, 1], "descending by size");
+    }
+
+    /// A search is not a filter of the folder on screen: it covers the drive,
+    /// because that is what the original's projection query covers. The folder
+    /// on the breadcrumb does not restrict it.
+    #[test]
+    fn a_search_covers_the_whole_drive_not_only_the_open_folder() {
+        let mut state = AppState {
+            files: vec![
+                folder(1, "Photos", ""),
+                folder(2, "2026", "d:1"),
+                file(3, "holiday.jpg", 10, "d:2"),
+                file(4, "notes.txt", 10, ""),
+            ],
+            ..AppState::default()
+        };
+        // Stand inside the folder and search from there.
+        state.enter_folder("d:1".to_string(), "Photos".to_string());
+        state.enter_folder("d:2".to_string(), "2026".to_string());
+        assert_eq!(state.visible_files(), vec![2], "the folder's own entry");
+
+        state.set_query("holiday".to_string());
+        assert_eq!(
+            state.visible_files(),
+            vec![2],
+            "a search finds the file whether or not it is on screen"
+        );
+
+        // And one that lives nowhere near the open folder is found just as well.
+        state.set_query("notes".to_string());
+        assert_eq!(state.visible_files(), vec![3]);
+    }
+
+    /// Folders lead files in the results, as they do in the original's two
+    /// queries, and each half stops at the limit that query clamps to.
+    #[test]
+    fn search_results_lead_with_folders_and_are_capped_per_kind() {
+        let mut files: Vec<RemoteFile> = Vec::new();
+        for index in 0..(SEARCH_LIMIT + 5) {
+            files.push(file(
+                index as i32 + 1,
+                &format!("match-{index:04}.txt"),
+                1,
+                "",
+            ));
+        }
+        files.push(folder(9001, "matches", ""));
+        let mut state = AppState {
+            files,
+            ..AppState::default()
+        };
+
+        state.set_query("match".to_string());
+        let rows = state.visible_files();
+        assert_eq!(rows.len(), SEARCH_LIMIT + 1, "one folder, then the cap");
+        assert!(
+            state.files[rows[0]].is_folder(),
+            "the folder leads the files"
+        );
+        assert!(
+            rows[1..]
+                .iter()
+                .all(|&index| !state.files[index].is_folder()),
+            "and the files follow it"
+        );
+    }
+
+    /// The path a result shows is the chain of folders above it, as the
+    /// original's `buildFolderPathLazy` writes it, and a result in the drive
+    /// itself is just the drive.
+    #[test]
+    fn a_search_result_reports_where_it_lives() {
+        let state = AppState {
+            files: vec![
+                folder(1, "Photos", ""),
+                folder(2, "2026", "d:1"),
+                file(3, "holiday.jpg", 10, "d:2"),
+                file(4, "notes.txt", 10, ""),
+                // A folder whose parent link points at itself must not loop.
+                folder(5, "loop", "d:5"),
+            ],
+            ..AppState::default()
+        };
+        let folders = state.folder_index();
+
+        assert_eq!(
+            AppState::folder_path(&folders, "d:2"),
+            "My Drive / Photos / 2026"
+        );
+        assert_eq!(AppState::folder_path(&folders, ""), "My Drive");
+        assert_eq!(AppState::folder_path(&folders, "d:1"), "My Drive / Photos");
+        assert_eq!(
+            AppState::folder_path(&folders, "d:5"),
+            "My Drive / loop",
+            "a folder that names itself as its parent ends the walk"
+        );
+        assert_eq!(
+            AppState::folder_path(&folders, "d:404"),
+            "My Drive",
+            "a missing folder is not a path"
+        );
+    }
+
+    /// Opening a result goes where it lives: the breadcrumb is rebuilt from the
+    /// parent links rather than walked forward from the root, the search is
+    /// over, and the file that was opened is the selected row.
+    #[test]
+    fn opening_a_result_rebuilds_the_breadcrumb_and_ends_the_search() {
+        let mut state = AppState {
+            files: vec![
+                folder(1, "Photos", ""),
+                folder(2, "2026", "d:1"),
+                file(3, "holiday.jpg", 10, "d:2"),
+                file(4, "notes.txt", 10, ""),
+            ],
+            ..AppState::default()
+        };
+        state.go_to_root("TDrive");
+        state.set_query("holiday".to_string());
+        assert_eq!(state.visible_files(), vec![2]);
+
+        // Double-clicking the result's folder: the crumb is rebuilt, the query
+        // is gone and the folder's own entries are on screen.
+        state.reveal_folder("d:2", "TDrive");
+        assert_eq!(
+            state
+                .folder
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["TDrive", "Photos", "2026"]
+        );
+        assert!(!state.searching());
+        assert_eq!(state.visible_files(), vec![2], "the folder's own file");
+
+        // Double-clicking a file: the row it names is selected once the list
+        // has changed under it.
+        state.set_query("notes".to_string());
+        state.reveal_folder("", "TDrive");
+        state.select_object("f:4");
+        assert_eq!(
+            state.selected_file,
+            Some(3),
+            "the selected row is the file, not its position in the list"
+        );
+        assert_eq!(state.visible_files(), vec![0, 3], "the folder, then the file");
+    }
+
+    /// A search is a file-list view, so it leaves Photos mode rather than
+    /// filtering the gallery, and the column reports the location.
+    #[test]
+    fn a_search_leaves_the_photos_view() {
+        let mut state = AppState {
+            files: vec![file(1, "holiday.jpg", 10, "")],
+            ..AppState::default()
+        };
+        state.set_view(ViewMode::Photos);
+        assert!(state.photos_only());
+
+        state.set_query("holiday".to_string());
+        assert_eq!(state.view, ViewMode::Drive);
+        assert!(!state.photos_only());
+        assert_eq!(state.visible_files(), vec![0]);
     }
 
     /// The key is kept when the same drive is reopened and dropped when a drive

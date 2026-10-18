@@ -7,6 +7,7 @@
 //! original palette, so nothing renders light-on-light.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -53,6 +54,10 @@ struct RowsCache {
     /// redraw would put the one remaining O(files) walk back into the frame
     /// that the row window exists to avoid, so it is memoised with the rows.
     total_size: i64,
+    /// Where each search result lives, by file index, drawn in place of its
+    /// date. Built with the rows, because a parent walk per frame is the same
+    /// kind of work the row window exists to avoid.
+    labels: Rc<BTreeMap<usize, String>>,
 }
 
 pub struct TDriveView {
@@ -1355,7 +1360,16 @@ impl TDriveView {
                     .child("Photos")
             }));
         let sort = self.state.sort;
-        let date_label = if trash_mode { "Time left" } else { "Date" };
+        let date_label = if trash_mode {
+            "Time left"
+        } else if self.state.searching() {
+            // A search spans every folder, so the column reports where each
+            // result lives; the sort control stays the date's, as the
+            // original's column-mode store leaves it.
+            "Location"
+        } else {
+            "Date"
+        };
         let table_header = div()
             .h(px(theme::TABLE_HEADER_H))
             .flex_shrink_0()
@@ -1440,6 +1454,15 @@ impl TDriveView {
         self.row_cache().1
     }
 
+    /// Where one row of a search lives, in place of its date. `None` outside a
+    /// search, where the column reports the date the row was added instead.
+    fn search_label(&self, index: usize) -> Option<String> {
+        let cache = self.rows_cache.borrow();
+        cache
+            .as_ref()
+            .and_then(|cache| cache.labels.get(&index).cloned())
+    }
+
     /// The visible rows and the drive's stored bytes for the current search
     /// box, sort, folder and view, computed once per `rows_version`.
     fn row_cache(&self) -> (Rc<Vec<usize>>, i64) {
@@ -1469,6 +1492,24 @@ impl TDriveView {
         } else {
             self.state.visible_files()
         });
+        let labels = Rc::new(if self.state.searching() {
+            // One parent index for the whole result set, rather than a walk of
+            // the drive per row.
+            let folders = self.state.folder_index();
+            rows.iter()
+                .map(|&file| {
+                    let row = &self.state.files[file];
+                    let from = if row.is_folder() {
+                        row.object_id.as_str()
+                    } else {
+                        row.parent.as_str()
+                    };
+                    (file, AppState::folder_path(&folders, from))
+                })
+                .collect::<BTreeMap<usize, String>>()
+        } else {
+            BTreeMap::new()
+        });
         let total_size = self.state.total_size();
         *self.rows_cache.borrow_mut() = Some(RowsCache {
             version,
@@ -1478,6 +1519,7 @@ impl TDriveView {
             trash,
             rows: Rc::clone(&rows),
             total_size,
+            labels,
         });
         (rows, total_size)
     }
@@ -1549,31 +1591,33 @@ impl TDriveView {
             (
                 IconName::Trash,
                 "Nothing in the trash",
-                "Anything you delete waits here until its time runs out, so you can put it back.",
+                "Anything you delete waits here until its time runs out, so you can put it back."
+                    .to_string(),
             )
         } else if self.state.active_drive.is_none() {
             (
                 IconName::HardDrive,
                 "No drive selected",
-                "Pick a drive on the left to see its files.",
+                "Pick a drive on the left to see its files.".to_string(),
             )
         } else if self.state.photos_only() {
             (
                 IconName::Images,
                 "No photos here",
-                "This drive has no images.",
+                "This drive has no images.".to_string(),
             )
-        } else if !self.state.query.trim().is_empty() {
+        } else if self.state.searching() {
             (
                 IconName::SearchX,
                 "No matches",
-                "No file in this drive matches the search.",
+                // The original names the query it found nothing for.
+                format!("No results for \"{}\"", self.state.query.trim()),
             )
         } else {
             (
                 IconName::Inbox,
                 "This drive is empty",
-                "Upload a file to put it in this drive.",
+                "Upload a file to put it in this drive.".to_string(),
             )
         };
         div()
@@ -1638,7 +1682,10 @@ impl TDriveView {
         let confirm_view = view.clone();
         let cancel_view = view.clone();
 
-        let date = short_date(file.date);
+        let date = match self.search_label(index) {
+            Some(label) => label,
+            None => short_date(file.date),
+        };
         let size = if is_folder {
             "—".to_string()
         } else {
@@ -1754,12 +1801,52 @@ impl TDriveView {
                 let clicking = open_view.clone();
                 let folder_id = folder_id.clone();
                 let folder_name = folder_name.clone();
+                let parent_id = file.parent.clone();
                 move |event, window, cx| {
                     // A single click selects the row; a double click activates
                     // it, which is the split the original's `activateRow`
                     // describes. Activation is what asks for the drive's key,
                     // because an encrypted file cannot be read before it.
                     let activate = event.click_count() >= 2;
+                    // A search result can live in any folder, so activating one
+                    // goes to where it is instead of acting on it in place,
+                    // which is the original's `openFileResult`.
+                    let searching = clicking.read(cx).state.searching();
+                    if searching {
+                        clicking.update(cx, |this, cx| {
+                            this.state.selected_file = Some(index);
+                            this.state.pending_delete = None;
+                            cx.notify();
+                        });
+                        if activate {
+                            clicking.update(cx, |this, cx| {
+                                let title = this
+                                    .state
+                                    .folder
+                                    .first()
+                                    .map(|crumb| crumb.name.clone())
+                                    .unwrap_or_default();
+                                let target = if is_folder {
+                                    folder_id.clone()
+                                } else {
+                                    parent_id.clone()
+                                };
+                                this.state.reveal_folder(&target, &title);
+                                if !is_folder {
+                                    this.state.select_object(&folder_id);
+                                }
+                                cx.notify();
+                            });
+                            // The search box is part of the mode the reveal
+                            // left, so it is emptied with it rather than left
+                            // showing a query the list no longer answers.
+                            clicking.update(cx, |this, cx| {
+                                let input = this.search_input.clone();
+                                input.update(cx, |state, cx| state.set_value("", window, cx));
+                            });
+                        }
+                        return;
+                    }
                     if is_folder {
                         if activate {
                             clicking.update(cx, |this, cx| {
