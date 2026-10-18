@@ -1325,7 +1325,7 @@ impl TDriveView {
             })
             .collect();
 
-        let photos_view = view.clone();
+        let gallery_view = view.clone();
         let trash_view = view.clone();
         let new_drive_view = view.clone();
         let join_view = view.clone();
@@ -1343,11 +1343,11 @@ impl TDriveView {
                     .child(sidebar_item(
                         SharedString::from("nav-photos"),
                         IconName::Images,
-                        "Photos".to_string(),
-                        view_mode == ViewMode::Photos,
+                        "Gallery".to_string(),
+                        view_mode == ViewMode::Gallery,
                         move |cx| {
-                            photos_view.update(cx, |this, cx| {
-                                this.state.set_view(ViewMode::Photos);
+                            gallery_view.update(cx, |this, cx| {
+                                this.state.set_view(ViewMode::Gallery);
                                 this.state.pending_delete = None;
                                 this.state.pending_purge = None;
                                 this.state.confirm_empty_trash = false;
@@ -1497,7 +1497,7 @@ impl TDriveView {
     fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
         let trash_mode = self.state.trash_mode();
-        let photos_mode = self.state.photos_only();
+        let gallery_mode = self.state.gallery_mode();
         let (loading, can_upload, error) = {
             let state = &self.state;
             (
@@ -1676,7 +1676,7 @@ impl TDriveView {
                 (trash_mode && trash_count > 0)
                     .then(|| empty_trash_button(view.clone(), empty_armed)),
             )
-            .children((photos_mode && !trash_mode).then(|| {
+            .children((gallery_mode && !trash_mode).then(|| {
                 div()
                     .flex_shrink_0()
                     .px(px(10.))
@@ -1686,7 +1686,7 @@ impl TDriveView {
                     .text_size(px(theme::TYPE_XS))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::accent())
-                    .child("Photos")
+                    .child("Gallery")
             }));
         let sort = self.state.sort;
         let date_label = if trash_mode {
@@ -1765,7 +1765,7 @@ impl TDriveView {
             .child(breadcrumb)
             .children(banner)
             .child(table_header)
-            .child(if photos_mode && !trash_mode {
+            .child(if gallery_mode && !trash_mode {
                 self.render_gallery(loading, cx)
             } else {
                 self.render_file_list(loading, cx)
@@ -1955,7 +1955,7 @@ impl TDriveView {
                 "No drive selected",
                 "Pick a drive on the left to see its files.".to_string(),
             )
-        } else if self.state.photos_only() {
+        } else if self.state.gallery_mode() {
             (
                 IconName::Images,
                 "No photos or videos here",
@@ -2033,7 +2033,7 @@ impl TDriveView {
                         .text_size(px(theme::TYPE_MD))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::text())
-                        .child("Loading photos..."),
+                        .child("Loading gallery..."),
                 )
                 .children((0..6).map(skeleton_row))
                 .into_any_element();
@@ -2047,124 +2047,172 @@ impl TDriveView {
             return self.empty_state().into_any_element();
         }
 
-        let mut grid = div()
-            .id("gallery")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .px(px(12.))
-            .py(px(12.))
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .gap(px(8.));
-
-        for &index in &indices {
-            let file = self.state.files[index].clone();
-            let drive_id = self.state.active_dialog().map(|d| d.id).unwrap_or(0);
-            let message_id = file.message_id;
-            let is_image = file.kind == FileKind::Image;
-            let encrypted = file.encrypted;
-            let key = self.state.vault.as_ref().and_then(|v| v.key);
-            let name = file.name.clone();
-
-            // The thumbnail is fetched once per tile; while it is on its way a
-            // placeholder keeps the grid stable.
-            let thumb = thumb_path(drive_id, message_id);
-            let exists = thumb.exists();
-            let downloading = self.state.gallery_downloads.contains(&message_id);
-
-            let tile_view = view.clone();
-            let thumb_for_click = thumb.clone();
-            let tile = div()
-                .w(px(152.))
-                .h(px(152.))
-                .flex_shrink_0()
-                .rounded(px(8.))
-                .overflow_hidden()
-                .bg(theme::surface_1())
-                .border_1()
-                .border_color(theme::border_soft())
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .when(is_image && !exists && !downloading, |el| {
-                    el.child(glyph(IconName::Image, 32., theme::text_muted()))
-                })
-                .when(!is_image, |el| {
-                    el.child(glyph(IconName::Video, 40., theme::text_muted()))
-                })
-                .when(is_image && exists, |el| {
-                    el.child(
-                        img(thumb.clone())
-                            .w(px(152.))
-                            .h(px(120.))
-                            .object_fit(ObjectFit::Cover),
-                    )
-                })
-                .child(
-                    div()
-                        .w_full()
-                        .px(px(6.))
-                        .py(px(4.))
-                        .text_size(px(theme::TYPE_XS))
-                        .text_color(theme::text_muted())
-                        .truncate()
-                        .child(name),
-                );
-
-            if is_image && !exists && !downloading {
-                self.state.gallery_downloads.insert(message_id);
-                let (client, peer_ref) = (
-                    self.state.tele.clone(),
-                    self.state.active_dialog().map(|d| d.peer_ref),
-                );
-                let thumb = thumb.clone();
-                let tile_view = tile_view.clone();
-                let encrypted = encrypted;
-                let key = key;
-                let message_id = message_id;
-                cx.defer(move |cx| {
-                    cx.spawn(async move |cx| {
-                        let result = cx
-                            .background_spawn(async move {
-                                if let Some(parent) = thumb.parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                let (Some(client), Some(peer_ref)) = (client, peer_ref) else {
-                                    return;
-                                };
-                                let messages = vec![message_id];
-                                let key_for_task = if encrypted { key } else { None };
-                                let _ = tele::download_file(
-                                    &client,
-                                    peer_ref,
-                                    &messages,
-                                    &thumb,
-                                    key_for_task,
-                                );
-                            })
-                            .await;
-                        let _ = result;
-                        cx.update(|cx| {
-                            tile_view.update(cx, |this, cx| {
-                                this.state.gallery_downloads.remove(&message_id);
-                                cx.notify();
-                            });
-                        });
-                    })
-                    .detach();
-                });
+        // Group media by their parent folder.
+        let mut folder_names: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for f in &self.state.files {
+            if f.is_folder() {
+                folder_names.insert(f.object_id.clone(), f.name.clone());
             }
+        }
+        let root_name = self
+            .state
+            .active_dialog()
+            .map(|d| d.title.clone())
+            .unwrap_or_else(|| "My Drive".to_string());
 
-            let _ = thumb_for_click;
-            grid = grid.child(tile);
+        let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for &index in &indices {
+            let parent = self.state.files[index].parent.clone();
+            groups.entry(parent).or_default().push(index);
         }
 
-        grid.into_any_element()
-    }
+        let drive_id = self.state.active_dialog().map(|d| d.id).unwrap_or(0);
 
+        // Virtualized: one row per (header or tile-row). Only visible rows
+        // render, which is what keeps a large library scrollable.
+        const TILES_PER_ROW: usize = 6;
+        enum GalleryRow {
+            Header(String, usize),
+            Tiles(Vec<usize>),
+        }
+        let mut gallery_rows: Vec<GalleryRow> = Vec::new();
+        for (parent, group_indices) in &groups {
+            let header_name = if parent.is_empty() {
+                root_name.clone()
+            } else {
+                folder_names
+                    .get(parent)
+                    .cloned()
+                    .unwrap_or_else(|| parent.clone())
+            };
+            gallery_rows.push(GalleryRow::Header(header_name, group_indices.len()));
+            for chunk in group_indices.chunks(TILES_PER_ROW) {
+                gallery_rows.push(GalleryRow::Tiles(chunk.to_vec()));
+            }
+        }
+        let row_count = gallery_rows.len();
+        let rows = std::rc::Rc::new(gallery_rows);
+
+        uniform_list("gallery", row_count, move |range, _window, cx| {
+            let this = view.read(cx);
+            let rows = rows.clone();
+            range
+                .map(|slot| match &rows[slot] {
+                    GalleryRow::Header(name, count) => div()
+                        .w_full()
+                        .py(px(4.))
+                        .text_size(px(theme::TYPE_SM))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text_soft())
+                        .child(format!("{name}  ({count} items)"))
+                        .into_any_element(),
+                    GalleryRow::Tiles(indices) => {
+                        let mut row = div().flex().flex_row().gap(px(8.)).py(px(4.));
+                        for &index in indices {
+                            let file = this.state.files[index].clone();
+                            let message_id = file.message_id;
+                            let is_image = file.kind == FileKind::Image;
+                            let encrypted = file.encrypted;
+                            let key = this.state.vault.as_ref().and_then(|v| v.key);
+                            let name = file.name.clone();
+                            let thumb = thumb_path(drive_id, message_id);
+                            let exists = thumb.exists();
+                            let downloading = this.state.gallery_downloads.contains(&message_id);
+
+                            let tile_view = view.clone();
+                            let tile = div()
+                                .w(px(152.))
+                                .h(px(152.))
+                                .flex_shrink_0()
+                                .rounded(px(8.))
+                                .overflow_hidden()
+                                .bg(theme::surface_1())
+                                .border_1()
+                                .border_color(theme::border_soft())
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .justify_center()
+                                .when(is_image && !exists && !downloading, |el| {
+                                    el.child(glyph(IconName::Image, 32., theme::text_muted()))
+                                })
+                                .when(!is_image, |el| {
+                                    el.child(glyph(IconName::Video, 40., theme::text_muted()))
+                                })
+                                .when(is_image && exists, |el| {
+                                    el.child(
+                                        img(thumb.clone())
+                                            .w(px(152.))
+                                            .h(px(120.))
+                                            .object_fit(ObjectFit::Cover),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .px(px(6.))
+                                        .py(px(4.))
+                                        .text_size(px(theme::TYPE_XS))
+                                        .text_color(theme::text_muted())
+                                        .truncate()
+                                        .child(name),
+                                );
+
+                            if is_image && !exists && !downloading {
+                                let thumb = thumb.clone();
+                                let tile_view = tile_view.clone();
+                                let encrypted = encrypted;
+                                let key = key;
+                                let message_id = message_id;
+                                let client = this.state.tele.clone();
+                                let peer_ref = this.state.active_dialog().map(|d| d.peer_ref);
+                                cx.spawn(async move |cx| {
+                                    tile_view.update(cx, |s, cx| {
+                                        s.state.gallery_downloads.insert(message_id);
+                                        cx.notify();
+                                    });
+                                    let result = cx
+                                        .background_spawn(async move {
+                                            if let Some(parent) = thumb.parent() {
+                                                let _ = std::fs::create_dir_all(parent);
+                                            }
+                                            let (Some(client), Some(peer_ref)) = (client, peer_ref)
+                                            else {
+                                                return;
+                                            };
+                                            let messages = vec![message_id];
+                                            let key_for_task = if encrypted { key } else { None };
+                                            let _ = tele::download_file(
+                                                &client,
+                                                peer_ref,
+                                                &messages,
+                                                &thumb,
+                                                key_for_task,
+                                            );
+                                        })
+                                        .await;
+                                    let _ = result;
+                                    cx.update(|cx| {
+                                        tile_view.update(cx, |this, cx| {
+                                            this.state.gallery_downloads.remove(&message_id);
+                                            cx.notify();
+                                        });
+                                    });
+                                })
+                                .detach();
+                            }
+
+                            row = row.child(tile);
+                        }
+                        row.into_any_element()
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_any_element()
+    }
     fn render_file_row(&self, index: usize, view: &Entity<TDriveView>) -> AnyElement {
         let view = view.clone();
         let file = self.state.files[index].clone();

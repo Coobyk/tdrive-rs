@@ -241,8 +241,8 @@ pub enum LocalState {
 pub enum ViewMode {
     /// A drive's own contents.
     Drive,
-    /// The active drive, narrowed to images.
-    Photos,
+    /// The active drive, narrowed to images and videos.
+    Gallery,
     /// Deleted items waiting to be restored or purged.
     Trash,
 }
@@ -583,8 +583,8 @@ impl AppState {
         self.active_drive.and_then(|i| self.drives.get(i))
     }
 
-    pub fn photos_only(&self) -> bool {
-        self.view == ViewMode::Photos
+    pub fn gallery_mode(&self) -> bool {
+        self.view == ViewMode::Gallery
     }
 
     pub fn trash_mode(&self) -> bool {
@@ -810,12 +810,12 @@ impl AppState {
         if self.searching() {
             return self.search_results();
         }
-        let folder = if self.photos_only() {
+        let folder = if self.gallery_mode() {
             None
         } else {
             Some(self.current_folder())
         };
-        self.order(&self.files, folder, self.photos_only())
+        self.order(&self.files, folder, self.gallery_mode())
     }
 
     /// Every entry in the drive whose name matches the search box, in the
@@ -1601,17 +1601,17 @@ mod tests {
     /// A search is a file-list view, so it leaves Photos mode rather than
     /// filtering the gallery, and the column reports the location.
     #[test]
-    fn a_search_leaves_the_photos_view() {
+    fn a_search_leaves_the_gallery_view() {
         let mut state = AppState {
             files: vec![file(1, "holiday.jpg", 10, "")],
             ..AppState::default()
         };
-        state.set_view(ViewMode::Photos);
-        assert!(state.photos_only());
+        state.set_view(ViewMode::Gallery);
+        assert!(state.gallery_mode());
 
         state.set_query("holiday".to_string());
         assert_eq!(state.view, ViewMode::Drive);
-        assert!(!state.photos_only());
+        assert!(!state.gallery_mode());
         assert_eq!(state.visible_files(), vec![0]);
     }
 
