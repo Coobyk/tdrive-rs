@@ -72,7 +72,7 @@ pub enum CryptoError {
 }
 
 /// Vault material parsed from a channel's `encfg` operation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VaultMaterial {
     /// Raw KDF salt.
     pub salt: Vec<u8>,

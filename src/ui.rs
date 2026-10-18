@@ -23,6 +23,7 @@ use gpui_component::{
 };
 use gpui_kit_assets::IconName;
 
+use crate::cache;
 use crate::config::{self, DEFAULT_CHANNEL_ABOUT, DEFAULT_CHANNEL_TITLE, DriveConfig, StoredDrive};
 use crate::crypto;
 use crate::format::{entry_origin, human_size, purge_countdown, short_date};
@@ -1217,6 +1218,15 @@ impl TDriveView {
                             .tooltip("Reload this drive")
                             .on_click(move |_, _window, cx| {
                                 if let Some(index) = reload_view.read(cx).state.active_drive {
+                                    // A reload is the way back to the truth the
+                                    // drive itself holds: drop the snapshot so
+                                    // the whole history is read again, and
+                                    // deletions made elsewhere show up.
+                                    if let Some(drive) =
+                                        reload_view.read(cx).state.drives.get(index)
+                                    {
+                                        cache::invalidate(drive.id);
+                                    }
                                     open_drive_clicked(reload_view.clone(), index, cx);
                                 }
                             })
@@ -2738,11 +2748,32 @@ fn spawn_open_drive_inner(view: Entity<TDriveView>, index: usize, cx: &mut App) 
         cx.notify();
     });
 
+    // A drive that was read before resumes from the snapshot it left behind:
+    // the replay carries on from there and only the messages that arrived since
+    // are fetched. `TDRIVE_FULL_LOAD=1` (and the Reload action) reads the whole
+    // history again instead.
+    let resume = if std::env::var_os("TDRIVE_FULL_LOAD").is_some() {
+        None
+    } else {
+        cache::load(drive_id).map(|snapshot| (snapshot.newest_message_id, snapshot.state))
+    };
+
     cx.spawn(async move |cx| {
         let result = cx
             .background_spawn({
                 let client = client.clone();
-                async move { tele::load_drive(&client, peer_ref) }
+                async move {
+                    let (contents, state, newest) = tele::load_drive(&client, peer_ref, resume)?;
+                    // Store what was read so the next launch can resume. A
+                    // failed write costs a slower load, never a wrong one.
+                    let _ = cache::save(&cache::Snapshot {
+                        version: cache::VERSION,
+                        drive_id,
+                        newest_message_id: newest,
+                        state,
+                    });
+                    Ok::<_, String>(contents)
+                }
             })
             .await;
         cx.update(|cx| {
@@ -3144,7 +3175,20 @@ fn spawn_delete(view: Entity<TDriveView>, index: usize, cx: &mut App) {
                     Ok(()) => {
                         // Deletion is a move to the trash, so the file keeps its
                         // name and size there until it is purged.
+                        let object_id = this
+                            .state
+                            .files
+                            .iter()
+                            .find(|file| file.message_id == message_id)
+                            .map(|file| file.object_id.clone());
                         move_file_to_trash(&mut this.state, message_id, &title);
+                        // The message is gone from the drive, and a message
+                        // that is gone is invisible to a resume watermark: take
+                        // the object out of the snapshot too, or the next launch
+                        // shows a file the drive no longer has.
+                        if let Some(object_id) = object_id {
+                            cache::forget_object(dialog_id, &object_id);
+                        }
                         this.state.status = format!("Moved {name} to trash");
                     }
                     Err(message) => this.state.error = Some(message),

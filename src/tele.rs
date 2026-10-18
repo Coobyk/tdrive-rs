@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use grammers_client::media::Media;
 use grammers_client::{Client, SignInError};
 use grammers_mtsender::SenderPool;
+use grammers_session::Session as _;
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::{PeerAuth, PeerId, PeerRef};
 use grammers_tl_types as tl;
@@ -37,10 +38,51 @@ pub async fn async_connect(creds: &Credentials, session_path: PathBuf) -> Result
             .await
             .map_err(|e| e.to_string())?,
     );
+    // A device that is already signed in to the original is signed in to the
+    // same account: take that authorization into this port's session instead of
+    // asking for a login code the user has already answered once. A key this
+    // port already holds always wins, so once it has signed in for itself the
+    // original's file stops mattering.
+    if !has_auth_key(&session) {
+        if let Some(imported) = crate::config::ImportedSession::load() {
+            if let Err(message) = async_import_session(&session, &imported).await {
+                // A failed import is not fatal: the sign-in screens are still
+                // there, and that is the path a fresh install takes anyway.
+                tracing::warn!("could not import the existing TDrive session: {message}");
+            }
+        }
+    }
     let SenderPool { runner, handle, .. } = SenderPool::new(Arc::clone(&session), creds.api_id);
     let client = Client::new(handle);
     tokio::spawn(runner.run());
     Ok(client)
+}
+
+/// Whether this session already holds a key for the account.
+fn has_auth_key(session: &SqliteSession) -> bool {
+    let Ok(home) = session.home_dc_id() else {
+        return false;
+    };
+    matches!(session.dc_option(home), Ok(Some(option)) if option.auth_key.is_some())
+}
+
+/// Take an authorization the original application already holds.
+///
+/// The key is only valid for the datacenter it was made with, so it is stored
+/// on that datacenter's option and the rest keep their well-known addresses
+/// without a key: connecting elsewhere signs in again rather than pretending
+/// to.
+pub async fn async_import_session(
+    session: &SqliteSession,
+    imported: &crate::config::ImportedSession,
+) -> Result<(), String> {
+    let mut data = grammers_session::SessionData::default();
+    data.home_dc = imported.dc_id;
+    let Some(option) = data.dc_options.get_mut(&imported.dc_id) else {
+        return Err(format!("no address for datacenter {}", imported.dc_id));
+    };
+    option.auth_key = Some(imported.auth_key);
+    data.import_to(session).await.map_err(|e| e.to_string())
 }
 
 pub async fn async_is_authorized(client: &Client) -> bool {
@@ -238,7 +280,8 @@ struct OpMessage {
 }
 
 /// One part of a multipart group, as the replay saw it.
-struct PartMessage {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PartMessage {
     index: u32,
     message_id: i32,
     kind: Option<FileKind>,
@@ -247,7 +290,8 @@ struct PartMessage {
 
 /// The objects one trash op took down: the object it named plus the descendants
 /// that were live at the time.
-struct TrashGroup {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TrashGroup {
     deleted_at: i64,
     /// The named object first, then its descendants.
     members: Vec<RemoteFile>,
@@ -346,6 +390,29 @@ fn row_from_op(
     }
 }
 
+/// Everything a replay needs to carry on later: the live tree, the trash
+/// groups, the multipart parts and the drive's encryption config.
+///
+/// This is what a snapshot stores, so a launch can start from where the last
+/// one stopped instead of reading the whole history again.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReplayState {
+    /// Live objects, by object id.
+    pub objects: BTreeMap<String, RemoteFile>,
+    /// Trash groups, keyed by the object the trash op named.
+    pub trashed: BTreeMap<String, TrashGroup>,
+    /// Multipart parts by group id, including groups no live object names yet.
+    pub parts: BTreeMap<String, Vec<PartMessage>>,
+    /// Objects whose bytes are a multipart group, by object id, by group id.
+    pub multipart: BTreeMap<String, String>,
+    /// The drive's encryption config, newest wins.
+    pub vault: Option<(VaultMaterial, String)>,
+    /// The media of every message the replay has seen, by message id: a
+    /// committed file's kind and size come from the message that holds its
+    /// bytes, which may sit outside the range a resumed read covers.
+    pub media: BTreeMap<i32, (Option<FileKind>, Option<i64>)>,
+}
+
 /// The replay's working state: the live tree, the trash, and the parts of
 /// multipart groups as they arrive.
 #[derive(Default)]
@@ -371,6 +438,23 @@ struct Replay {
 }
 
 impl Replay {
+    /// Carry on from a state a previous replay produced.
+    ///
+    /// The second half of a load: the objects, trash and parts that were
+    /// already projected, so an operation arriving now lands on the tree the
+    /// last launch built rather than on an empty one.
+    fn from_state(state: ReplayState, trace: bool) -> Self {
+        Replay {
+            objects: state.objects,
+            trashed: state.trashed,
+            parts: state.parts,
+            multipart: state.multipart,
+            vault: state.vault,
+            trace,
+            counts: BTreeMap::new(),
+        }
+    }
+
     /// Apply one operation. Operations are replayed oldest first, so a rename
     /// or a move that arrived after an upload lands after it.
     fn apply(
@@ -684,7 +768,7 @@ impl Replay {
     }
 
     /// Split the result into the live tree and the trash the drive itself holds.
-    fn finish(mut self) -> DriveContents {
+    fn finish(mut self) -> (DriveContents, ReplayState) {
         for (object_id, uuid) in std::mem::take(&mut self.multipart) {
             let Some(found) = self.parts.get(&uuid) else {
                 continue;
@@ -707,45 +791,94 @@ impl Replay {
             file.content = ContentRef::Parts(ids);
         }
 
-        let mut files: Vec<RemoteFile> = self.objects.into_values().collect();
+        // The state a later launch resumes from, taken once the multipart
+        // groups have been resolved into the objects that name them.
+        let state = ReplayState {
+            objects: self.objects,
+            trashed: self.trashed,
+            parts: self.parts,
+            multipart: BTreeMap::new(),
+            vault: self.vault,
+            media: BTreeMap::new(),
+        };
+
+        let mut files: Vec<RemoteFile> = state.objects.values().cloned().collect();
         files.sort_by(|a, b| {
             b.date
                 .cmp(&a.date)
                 .then_with(|| b.message_id.cmp(&a.message_id))
         });
 
-        let mut trash: Vec<TrashedObject> = self
+        let mut trash: Vec<TrashedObject> = state
             .trashed
-            .into_values()
+            .values()
             .filter_map(|group| {
                 let deleted_at = group.deleted_at;
-                group
-                    .members
-                    .into_iter()
-                    .next()
-                    .map(|file| TrashedObject { file, deleted_at })
+                group.members.first().map(|file| TrashedObject {
+                    file: file.clone(),
+                    deleted_at,
+                })
             })
             .collect();
         trash.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
 
-        DriveContents {
-            files,
-            trash,
-            vault: self.vault,
-        }
+        (
+            DriveContents {
+                files,
+                trash,
+                vault: state.vault.clone(),
+            },
+            state,
+        )
     }
 }
 
-pub async fn async_load_drive(client: &Client, peer_ref: PeerRef) -> Result<DriveContents, String> {
+/// Read a drive's operations into the files and folders they describe.
+///
+/// Without `resume` the whole history is read. With it — a watermark message
+/// id and the state a previous read produced — the replay continues from that
+/// state and only the messages after the watermark are fetched, which is what
+/// keeps a second launch to a single request instead of dozens.
+pub async fn async_load_drive(
+    client: &Client,
+    peer_ref: PeerRef,
+    resume: Option<(i32, ReplayState)>,
+) -> Result<(DriveContents, ReplayState, i32), String> {
+    let trace = std::env::var("TDRIVE_TRACE_OPS").is_ok();
+    let since = resume.as_ref().map(|(newest, _)| *newest);
+    // Every message that carries media, by id. The writable-mount path keeps a
+    // file's bytes in a separate hidden body message, so the row's kind and
+    // size come from a message that is not itself an op. A resumed read starts
+    // from the media the snapshot stored, because a new commit can name a body
+    // that arrived before the watermark.
+    let (mut media_by_id, mut replay) = match resume {
+        Some((_, mut state)) => {
+            let media = std::mem::take(&mut state.media);
+            (media, Replay::from_state(state, trace))
+        }
+        None => (
+            BTreeMap::new(),
+            Replay {
+                trace,
+                ..Replay::default()
+            },
+        ),
+    };
     let mut messages = client.iter_messages(peer_ref);
     let mut seen: Vec<OpMessage> = Vec::new();
     let mut scanned = 0usize;
-    // Every message that carries media, by id. The writable-mount path keeps a
-    // file's bytes in a separate hidden body message, so the row's kind and
-    // size come from a message that is not itself an op.
-    let mut media_by_id: BTreeMap<i32, (Option<FileKind>, Option<i64>)> = BTreeMap::new();
+    let mut newest = since.unwrap_or_default();
     while let Some(message) = messages.next().await.map_err(|e| e.to_string())? {
+        // Telegram serves history newest first, so the first message at or
+        // below the watermark ends the read: everything older is already in
+        // the state this load resumed from.
+        if let Some(since) = since {
+            if message.id() <= since {
+                break;
+            }
+        }
         scanned += 1;
+        newest = newest.max(message.id());
         let media = message.media();
         let (kind, size) = match &media {
             Some(Media::Document(document)) => {
@@ -782,41 +915,35 @@ pub async fn async_load_drive(client: &Client, peer_ref: PeerRef) -> Result<Driv
     // a move that arrived after an upload has to be applied after it.
     seen.sort_by_key(|entry| entry.message_id);
     let seen_len = seen.len();
-
-    let mut replay = Replay {
-        trace: std::env::var("TDRIVE_TRACE_OPS").is_ok(),
-        ..Replay::default()
-    };
     for entry in seen {
         replay.apply(entry, &media_by_id);
     }
 
-    if std::env::var("TDRIVE_TRACE_OPS").is_ok() {
+    let counts = std::mem::take(&mut replay.counts);
+    let (contents, mut state) = replay.finish();
+    // The media of everything read so far travels with the state: a commit
+    // arriving later may name a body that is older than the watermark.
+    state.media = media_by_id;
+
+    if trace {
+        let objects = &state.objects;
         // A development aid for replay gaps: counts and object ids only, never
         // names or contents. `orphans` above zero means an object names a
         // parent the replay never saw.
-        let folders = replay
-            .objects
+        let folders = objects.values().filter(|file| file.is_folder()).count();
+        let encrypted = objects.values().filter(|file| file.encrypted).count();
+        let orphans = objects
             .values()
-            .filter(|file| file.is_folder())
+            .filter(|file| !file.parent.is_empty() && !objects.contains_key(&file.parent))
             .count();
-        let encrypted = replay
-            .objects
-            .values()
-            .filter(|file| file.encrypted)
-            .count();
-        let orphans = replay
-            .objects
-            .values()
-            .filter(|file| !file.parent.is_empty() && !replay.objects.contains_key(&file.parent))
-            .count();
+        let media_by_id = &state.media;
         // A committed file names its bytes on another message. If that message
         // was never seen the row cannot be downloaded, so the count is the
         // check that the replay read every body it needs.
         let mut bodies_missing = 0;
         let mut bodies_self = 0;
         let mut bodies_other = 0;
-        for file in replay.objects.values() {
+        for file in objects.values() {
             match &file.content {
                 ContentRef::Message(id) => {
                     if !media_by_id.contains_key(id) {
@@ -848,7 +975,7 @@ pub async fn async_load_drive(client: &Client, peer_ref: PeerRef) -> Result<Driv
         // would silently truncate. The count has to stay at zero.
         let mut size_gap = 0;
         let mut biggest_gap = 0;
-        for file in replay.objects.values() {
+        for file in objects.values() {
             if let Some((_, Some(media_size))) = media_by_id.get(&file.message_id) {
                 if file.size > *media_size {
                     size_gap += 1;
@@ -856,20 +983,20 @@ pub async fn async_load_drive(client: &Client, peer_ref: PeerRef) -> Result<Driv
                 }
             }
         }
-        let most_parts = replay.parts.values().map(|group| group.len()).max();
+        let most_parts = state.parts.values().map(|group| group.len()).max();
         eprintln!(
-            "TRACE scanned={scanned} ops={seen_len} objects={} folders={folders} encrypted={encrypted} trashed={} orphans={orphans} multipart={} part_groups={} most_parts={most_parts:?} bodies_missing={bodies_missing} bodies_self={bodies_self} bodies_other={bodies_other} size_gap={size_gap} biggest_gap={biggest_gap}",
-            replay.objects.len(),
-            replay.trashed.len(),
-            replay.multipart.len(),
-            replay.parts.len(),
+            "TRACE since={since:?} scanned={scanned} ops={seen_len} objects={} folders={folders} encrypted={encrypted} trashed={} orphans={orphans} multipart={} part_groups={} most_parts={most_parts:?} bodies_missing={bodies_missing} bodies_self={bodies_self} bodies_other={bodies_other} size_gap={size_gap} biggest_gap={biggest_gap} newest={newest}",
+            objects.len(),
+            state.trashed.len(),
+            state.multipart.len(),
+            state.parts.len(),
         );
-        for (op_type, count) in &replay.counts {
+        for (op_type, count) in &counts {
             eprintln!("TRACE op_type={op_type} count={count}");
         }
     }
 
-    Ok(replay.finish())
+    Ok((contents, state, newest))
 }
 
 // --- Writes -----------------------------------------------------------------
@@ -1050,8 +1177,12 @@ pub fn create_personal_channel(
 ) -> Result<OwnedChannel, String> {
     RT.block_on(async_create_personal_channel(client, title, about))
 }
-pub fn load_drive(client: &Client, peer_ref: PeerRef) -> Result<DriveContents, String> {
-    RT.block_on(async_load_drive(client, peer_ref))
+pub fn load_drive(
+    client: &Client,
+    peer_ref: PeerRef,
+    resume: Option<(i32, ReplayState)>,
+) -> Result<(DriveContents, ReplayState, i32), String> {
+    RT.block_on(async_load_drive(client, peer_ref, resume))
 }
 pub fn delete_file(client: &Client, peer_ref: PeerRef, message_id: i32) -> Result<(), String> {
     RT.block_on(async_delete_file(client, peer_ref, message_id))
@@ -1212,7 +1343,7 @@ mod tests {
             ),
             &media,
         );
-        let contents = replay.finish();
+        let (contents, _) = replay.finish();
 
         let folder = find(&contents, "d:db126e90-3715-499f-97a6-4a543993dfae");
         assert!(folder.is_folder());
@@ -1253,7 +1384,7 @@ mod tests {
             &no_media(),
         );
 
-        let contents = replay.finish();
+        let (contents, _) = replay.finish();
         assert!(
             contents.files.is_empty(),
             "the subtree is not live any more"
@@ -1295,7 +1426,7 @@ mod tests {
             ),
             &no_media(),
         );
-        let contents = replay.finish();
+        let (contents, _) = replay.finish();
         assert!(contents.trash.is_empty());
         let folder = find(&contents, "d:zeta");
         assert_eq!(folder.name, "Ringtones (restored)");
@@ -1355,7 +1486,7 @@ mod tests {
             &no_media(),
         );
 
-        let contents = replay.finish();
+        let (contents, _) = replay.finish();
         assert_eq!(contents.files.len(), 1, "the file stays trashed");
         assert_eq!(contents.files[0].object_id, "d:zeta");
         assert_eq!(contents.trash.len(), 1);
@@ -1387,7 +1518,7 @@ mod tests {
             &no_media(),
         );
 
-        let contents = replay.finish();
+        let (contents, _) = replay.finish();
         assert_eq!(contents.files.len(), 1);
         assert_eq!(find(&contents, "f:1").name, "victim.txt");
         assert_eq!(find(&contents, "f:1").revision, 2);
@@ -1430,7 +1561,7 @@ mod tests {
             &no_media(),
         );
 
-        let contents = replay.finish();
+        let (contents, _) = replay.finish();
         assert!(contents.files.is_empty());
         assert!(contents.trash.is_empty());
     }
@@ -1463,7 +1594,7 @@ mod tests {
             &no_media(),
         );
 
-        let contents = replay.finish();
+        let (contents, _) = replay.finish();
         let file = find(&contents, "f:3");
         assert_eq!(file.content, ContentRef::Parts(vec![2, 1]));
         assert_eq!(file.kind, FileKind::Document);
@@ -1497,12 +1628,135 @@ mod tests {
             &no_media(),
         );
 
-        let contents = replay.finish();
+        let (contents, _) = replay.finish();
         let file = find(&contents, "f:1");
         assert_eq!(file.content, ContentRef::Message(11));
         assert_eq!(file.size, 200);
         assert_eq!(file.plaintext_size, Some(150));
         assert!(file.encrypted);
         assert_eq!(file.revision, 2);
+    }
+
+    /// What a load produced, in a shape two loads can be compared by: the
+    /// fields a resume has to get right, sorted so the comparison does not
+    /// depend on the order the objects were read in.
+    fn shape(contents: &DriveContents) -> Vec<(String, String, String, i64, ContentRef, i64)> {
+        let mut rows: Vec<_> = contents
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.object_id.clone(),
+                    file.name.clone(),
+                    file.parent.clone(),
+                    file.size,
+                    file.content.clone(),
+                    file.revision,
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// The operations a drive held when it was first read.
+    fn early_ops() -> Vec<OpMessage> {
+        vec![
+            folder_commit(1, "d:photos", "", "Photos"),
+            file_commit(2, "d:photos", "one.jpg", 9, None),
+            entry(
+                3,
+                Op::Trash {
+                    op_id: "op-3".to_string(),
+                    obj: "d:photos".to_string(),
+                    expected_revision: 1,
+                    deleted_at: 1_700_000_000,
+                    purge_after: 1_700_000_001,
+                },
+            ),
+        ]
+    }
+
+    /// The operations that arrived between two launches: a restore, a file
+    /// whose bytes are on the body message, and a new multipart group.
+    fn later_ops() -> Vec<OpMessage> {
+        vec![
+            entry(
+                4,
+                Op::Untrash {
+                    op_id: "op-4".to_string(),
+                    obj: "d:photos".to_string(),
+                    parent: String::new(),
+                    name: "Photos".to_string(),
+                    expected_revision: 1,
+                },
+            ),
+            file_commit(5, "d:photos", "two.jpg", 9, None),
+            part(6, "group-a", 0, FileKind::Image, 4096),
+            entry(
+                7,
+                Op::Manifest {
+                    uuid: "group-a".to_string(),
+                    parent: "d:photos".to_string(),
+                    name: "album.jpg".to_string(),
+                    part_count: 1,
+                    size: None,
+                    uploaded_at: None,
+                    encrypted: false,
+                    encryption_version: 0,
+                    plaintext_size: None,
+                },
+            ),
+        ]
+    }
+
+    /// A second launch resumes from the state the first one left behind and
+    /// reads only what came after. It has to land exactly where one long read
+    /// of the whole history lands, trash and multipart groups included: this is
+    /// what makes a snapshot a cache of the replay rather than a second, subtly
+    /// different implementation of it.
+    #[test]
+    fn resuming_from_a_snapshot_matches_a_full_replay() {
+        let media = media(FileKind::Image, 4096);
+
+        // The first launch reads the drive as it was and keeps its state.
+        let mut first = Replay::default();
+        for op in early_ops() {
+            first.apply(op, &media);
+        }
+        let (first_contents, first_state) = first.finish();
+        assert_eq!(first_contents.trash.len(), 1, "the folder is in the trash");
+
+        // The second launch resumes from that state and reads the rest.
+        let mut resumed = Replay::from_state(first_state, false);
+        for op in later_ops() {
+            resumed.apply(op, &media);
+        }
+        let (resumed_contents, resumed_state) = resumed.finish();
+
+        // One read of everything, for comparison.
+        let mut full = Replay::default();
+        for op in early_ops().into_iter().chain(later_ops()) {
+            full.apply(op, &media);
+        }
+        let (full_contents, _) = full.finish();
+
+        assert_eq!(shape(&resumed_contents), shape(&full_contents));
+        assert!(
+            resumed_contents.trash.is_empty(),
+            "the restore emptied the trash, in both reads"
+        );
+        assert!(full_contents.trash.is_empty());
+
+        // A group whose parts arrived before the op that names them is resolved
+        // the same way on both paths.
+        let album = find(&resumed_contents, "f:7");
+        assert_eq!(album.content, ContentRef::Parts(vec![6]));
+        assert_eq!(album.size, 4096);
+
+        // And the state that goes back into a snapshot is as complete as the
+        // one that came out.
+        assert_eq!(resumed_state.objects.len(), resumed_contents.files.len());
+        assert!(resumed_state.multipart.is_empty(), "groups are resolved");
     }
 }

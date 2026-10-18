@@ -82,7 +82,7 @@ pub struct DriveCandidate {
 /// These are the families from the original `file-list/file-type.ts`: coarse
 /// on purpose, because a reader does not need to tell ODT from RTF at list
 /// speed, only a document from a video.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FileKind {
     Folder,
     Document,
@@ -156,7 +156,7 @@ impl FileKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RemoteFile {
     /// The message this row was read from: the op message for a `t=f` upload,
     /// the commit message for an `fcommit` file.
@@ -194,7 +194,7 @@ pub struct RemoteFile {
 /// one message. The writable-mount path splits them, so a row has to remember
 /// which message to fetch: an `fcommit` names a hidden body message, or a
 /// multipart group whose parts have to be fetched in order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum ContentRef {
     /// The op message itself carries the bytes (`t=f` uploads).
     OpMessage,
@@ -225,7 +225,7 @@ impl RemoteFile {
 
 /// Where a row is in the download lifecycle, so the list can show progress
 /// rather than a static "downloaded" line in a status bar.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LocalState {
     Remote,
     Downloading { done: i64 },

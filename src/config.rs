@@ -30,6 +30,71 @@ pub fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("TDrive"))
 }
 
+/// The authorization the original application already holds.
+///
+/// The original signs in with the same credentials and then keeps the account's
+/// MTProto authorization in its own `session.json`. Reading it is what makes a
+/// device that is already signed in to TDrive signed in here as well, instead
+/// of asking for a second login and a second code for the same account. The
+/// file is only ever read: the port keeps its own session beside it.
+#[derive(Clone)]
+pub struct ImportedSession {
+    /// The datacenter the authorization belongs to.
+    pub dc_id: i32,
+    /// The account's 256-byte MTProto authorization key.
+    pub auth_key: [u8; 256],
+}
+
+impl ImportedSession {
+    /// The original's session file, in the shared data directory.
+    pub fn path() -> PathBuf {
+        data_dir().join("session.json")
+    }
+
+    /// Read the original's session, when there is one.
+    ///
+    /// A missing file, an unreadable one, a key of the wrong size or a
+    /// datacenter this port does not know all mean the same thing: no
+    /// authorization to import, and the ordinary sign-in runs instead.
+    pub fn load() -> Option<Self> {
+        let raw = std::fs::read_to_string(Self::path()).ok()?;
+        Self::parse(&raw)
+    }
+
+    /// The same read, from text, so the shape can be tested without the file.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let data = value.get("Data")?;
+        let dc_id = data.get("DC")?.as_i64()? as i32;
+        if !(1..=5).contains(&dc_id) {
+            return None;
+        }
+        let encoded = data.get("AuthKey")?.as_str()?;
+        let bytes = decode_key(encoded)?;
+        let auth_key: [u8; 256] = bytes.try_into().ok()?;
+        Some(Self { dc_id, auth_key })
+    }
+}
+
+/// Decode an authorization key out of the original's session file.
+///
+/// Go writes it with the standard padded alphabet; the unpadded and URL-safe
+/// alphabets are accepted too, because a key is a key and the alternative is a
+/// sign-in the user does not need.
+fn decode_key(encoded: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    for engine in [
+        &base64::engine::general_purpose::STANDARD,
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        &base64::engine::general_purpose::URL_SAFE,
+    ] {
+        if let Ok(bytes) = engine.decode(encoded) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
 /// Create the data directory with the original's private mode.
 fn ensure_data_dir() -> Result<(), String> {
     let path = data_dir();
@@ -299,5 +364,64 @@ mod tests {
         assert_eq!(rows.map(|row| row.0), [2, 3, 1]);
         assert!(is_default_title("  tdrive "));
         assert!(!is_default_title("tdrive backup"));
+    }
+
+    /// The original's session file holds the datacenter and the account's key,
+    /// base64 as Go writes them. Reading it is what means a device already
+    /// signed in to TDrive does not have to sign in again here.
+    #[test]
+    fn the_original_session_is_read_for_its_key() {
+        use base64::Engine as _;
+        let bytes: Vec<u8> = (0..=255u8).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let raw = format!(
+            r#"{{"Version":1,"Data":{{"Config":{{"ThisDC":2}},"DC":2,"AuthKey":"{encoded}","AuthKeyID":"AAAA"}}}}"#
+        );
+
+        let imported = ImportedSession::parse(&raw).expect("a session to import");
+        assert_eq!(imported.dc_id, 2);
+        assert_eq!(&imported.auth_key[..4], &[0, 1, 2, 3]);
+        assert_eq!(imported.auth_key[255], 255);
+    }
+
+    /// Anything else is not an authorization to import: the port shows its
+    /// sign-in screens instead of refusing to start or, worse, connecting with
+    /// half a key.
+    #[test]
+    fn a_session_without_a_usable_key_is_not_imported() {
+        use base64::Engine as _;
+        let standard =
+            |length: usize| base64::engine::general_purpose::STANDARD.encode(vec![7u8; length]);
+
+        assert!(ImportedSession::parse("not json at all").is_none());
+        assert!(ImportedSession::parse("{}").is_none());
+        assert!(
+            ImportedSession::parse(r#"{"Data":{"DC":2}}"#).is_none(),
+            "no key"
+        );
+        assert!(
+            ImportedSession::parse(&format!(
+                r#"{{"Data":{{"DC":2,"AuthKey":"{}"}}}}"#,
+                standard(255)
+            ))
+            .is_none(),
+            "a key that is not 256 bytes is not a key"
+        );
+        assert!(
+            ImportedSession::parse(&format!(
+                r#"{{"Data":{{"DC":99,"AuthKey":"{}"}}}}"#,
+                standard(256)
+            ))
+            .is_none(),
+            "a datacenter this port cannot reach"
+        );
+        assert!(
+            ImportedSession::parse(&format!(
+                r#"{{"Data":{{"DC":2,"AuthKey":"{}"}}}}"#,
+                "!!! not base64 !!!"
+            ))
+            .is_none(),
+            "a key that is not base64"
+        );
     }
 }
