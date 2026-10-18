@@ -1044,22 +1044,109 @@ pub async fn async_upload_file(
     path: &Path,
     parent: &str,
     name: &str,
+    key: Option<[u8; 32]>,
 ) -> Result<(), String> {
-    let size = std::fs::metadata(path)
+    let plaintext_size = std::fs::metadata(path)
         .map(|meta| meta.len() as i64)
         .unwrap_or_default();
-    let uploaded = client.upload_file(path).await.map_err(|e| e.to_string())?;
-    let caption = ops::format_file(parent, name, size, Utc::now().timestamp());
-    // For a media message the caption is the message text, which is the field
-    // `messages.sendMedia` reads (grammers has no separate caption setter).
+
+    // An encrypted upload is not a different operation. The body is the
+    // ciphertext and the attribute says how to read it (`enc=1`, `psz=` the
+    // size before encryption), which is exactly what the original writes.
+    let (body, op) = match key {
+        Some(key) => {
+            let staged = staged_ciphertext(path, &key)?;
+            let size = std::fs::metadata(&staged)
+                .map(|meta| meta.len() as i64)
+                .unwrap_or_default();
+            let op = Op::File {
+                parent: parent.to_string(),
+                name: name.to_string(),
+                size: Some(size),
+                uploaded_at: Some(Utc::now().timestamp()),
+                encrypted: true,
+                encryption_version: 1,
+                plaintext_size: Some(plaintext_size),
+            };
+            (staged, op)
+        }
+        None => (
+            path.to_path_buf(),
+            Op::File {
+                parent: parent.to_string(),
+                name: name.to_string(),
+                size: Some(plaintext_size),
+                uploaded_at: Some(Utc::now().timestamp()),
+                encrypted: false,
+                encryption_version: 0,
+                plaintext_size: None,
+            },
+        ),
+    };
+
+    let uploaded = client.upload_file(&body).await;
+    let uploaded = match uploaded {
+        Ok(uploaded) => uploaded,
+        Err(err) => {
+            if body != path {
+                let _ = std::fs::remove_file(&body);
+            }
+            return Err(err.to_string());
+        }
+    };
+
+    // The caption is the message text for a document (grammers has no separate
+    // caption setter), and the original appends the same second line so that a
+    // reader with no operation to parse still learns the file's name.
+    let caption = format!("{}\nTDrive: {}", ops::format(&op), name);
     let input = grammers_client::message::InputMessage::new()
         .document(uploaded)
         .text(caption);
-    client
+    let sent = client
         .send_message(peer_ref, input)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string());
+    if body != path {
+        let _ = std::fs::remove_file(&body);
+    }
+    sent?;
     Ok(())
+}
+
+/// Encrypt one file into a temporary file and return its path.
+///
+/// The plaintext never leaves the disk unencrypted: the ciphertext is written
+/// first and only that file is handed to the uploader.
+fn staged_ciphertext(path: &Path, key: &[u8; 32]) -> Result<PathBuf, String> {
+    let mut source = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let staged = std::env::temp_dir().join(format!("tdrive-upload-{}.tde1", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut sink = std::fs::File::create(&staged).map_err(|e| e.to_string())?;
+        crypto::encrypt_stream(&mut source, &mut sink, key).map_err(|e| e.to_string())?;
+        sink.sync_all().map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&staged);
+        return Err(err);
+    }
+    Ok(staged)
+}
+
+/// The `encfg` operation that turns a drive encrypted.
+///
+/// The hint is trimmed here and again when it is applied, matching both sides
+/// of the original.
+pub fn enc_config_op(material: &VaultMaterial, hint: &str) -> Op {
+    Op::EncConfig {
+        salt: material.salt.clone(),
+        params_json: material.params_json.clone(),
+        wrapped_master_key: material.wrapped_master_key.clone(),
+        key_check: material.key_check.clone(),
+        hint: hint.trim().to_string(),
+        config_version: 1,
+        enabled: true,
+    }
 }
 
 /// The messages a purge deletes: the bodies of every file in the named trashed
@@ -1281,8 +1368,9 @@ pub fn upload_file(
     path: &Path,
     parent: &str,
     name: &str,
+    key: Option<[u8; 32]>,
 ) -> Result<(), String> {
-    RT.block_on(async_upload_file(client, peer_ref, path, parent, name))
+    RT.block_on(async_upload_file(client, peer_ref, path, parent, name, key))
 }
 pub fn download_file(
     client: &Client,
@@ -1297,6 +1385,31 @@ pub fn download_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The config operation carries the vault material as it is stored and
+    /// comes back from the wire unchanged, which is what lets any reader of the
+    /// drive unlock it.
+    #[test]
+    fn encryption_config_op_round_trips_through_the_wire() {
+        let material = VaultMaterial {
+            salt: vec![1, 2, 3, 4],
+            params_json: r#"{"kdf":"argon2id","memory":65536,"time":3,"parallelism":4,"key_len":32,"salt_len":16}"#.to_string(),
+            wrapped_master_key: vec![7; 72],
+            key_check: vec![9; 59],
+        };
+        let op = enc_config_op(&material, "  pet name  ");
+        let wire = ops::format(&op);
+        // The hint travels trimmed, exactly as the original writes it.
+        assert!(wire.contains("|hint=pet+name"));
+        assert!(!wire.contains("hint=++pet"));
+        assert!(
+            !wire.contains("|cv="),
+            "version 1 does not write cv: {wire}"
+        );
+
+        let parsed = ops::parse(&wire).expect("parse").expect("an op");
+        assert_eq!(parsed, op);
+    }
 
     /// One replayed op, with no media of its own.
     fn entry(message_id: i32, op: Op) -> OpMessage {

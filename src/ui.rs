@@ -14,8 +14,8 @@ use std::rc::Rc;
 use chrono::{DateTime, Utc};
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, IntoElement, ParentElement, Render, Rgba,
-    SharedString, Styled, Subscription, Window, div, px, uniform_list,
+    AnyElement, App, Context, Entity, FontWeight, IntoElement, ObjectFit, ParentElement, Render,
+    Rgba, SharedString, Styled, Subscription, Window, div, img, px, uniform_list,
 };
 use gpui_component::{
     Disableable, Icon,
@@ -26,7 +26,7 @@ use gpui_kit_assets::IconName;
 
 use crate::cache;
 use crate::config::{self, DEFAULT_CHANNEL_ABOUT, DEFAULT_CHANNEL_TITLE, DriveConfig, StoredDrive};
-use crate::crypto;
+use crate::crypto::{self, VaultMaterial};
 use crate::format::{entry_origin, human_size, purge_countdown, short_date};
 use crate::models::{
     AppState, ContentRef, Drive, DriveCandidate, DriveKind, FileKind, LocalState, LoginStep,
@@ -72,6 +72,11 @@ pub struct TDriveView {
     search_input: Entity<InputState>,
     /// The passphrase field in the "Unlock encrypted files" prompt.
     vault_input: Entity<InputState>,
+    /// The three fields of the first-time encryption setup: password, its
+    /// confirmation, and the optional hint the unlock prompt shows.
+    encrypt_password_input: Entity<InputState>,
+    encrypt_confirm_input: Entity<InputState>,
+    encrypt_hint_input: Entity<InputState>,
     rows_cache: RefCell<Option<RowsCache>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -88,11 +93,20 @@ impl TDriveView {
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search files..."));
         let vault_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Encryption password"));
+        let encrypt_password_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Password"));
+        let encrypt_confirm_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Confirm password"));
+        let encrypt_hint_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Optional hint (do not put the password here)")
+        });
 
         // Secrets render as dots and stay out of the clipboard, the way the
         // original treats the two-factor password and the passphrase.
         password_input.update(cx, |state, cx| state.set_masked(true, window, cx));
         vault_input.update(cx, |state, cx| state.set_masked(true, window, cx));
+        encrypt_password_input.update(cx, |state, cx| state.set_masked(true, window, cx));
+        encrypt_confirm_input.update(cx, |state, cx| state.set_masked(true, window, cx));
 
         let mut this = Self {
             state: AppState::default(),
@@ -103,6 +117,9 @@ impl TDriveView {
             password_input,
             search_input,
             vault_input,
+            encrypt_password_input,
+            encrypt_confirm_input,
+            encrypt_hint_input,
             rows_cache: RefCell::new(None),
             _subscriptions: Vec::new(),
         };
@@ -152,6 +169,18 @@ impl TDriveView {
             (this.code_input.clone(), LoginAction::Verify),
             (this.password_input.clone(), LoginAction::Unlock),
             (this.vault_input.clone(), LoginAction::UnlockVault),
+            (
+                this.encrypt_password_input.clone(),
+                LoginAction::SubmitEncryptionSetup,
+            ),
+            (
+                this.encrypt_confirm_input.clone(),
+                LoginAction::SubmitEncryptionSetup,
+            ),
+            (
+                this.encrypt_hint_input.clone(),
+                LoginAction::SubmitEncryptionSetup,
+            ),
         ] {
             let weak = weak.clone();
             let subscription = cx.subscribe(
@@ -435,6 +464,8 @@ impl Render for TDriveView {
             _ => self.render_login(cx).into_any_element(),
         };
         let vault_prompt = self.render_vault_prompt(cx);
+        let encryption_setup = self.render_encryption_setup(cx);
+        let upload_options = self.render_upload_options(cx);
         div()
             .size_full()
             .flex()
@@ -444,6 +475,8 @@ impl Render for TDriveView {
             .text_color(theme::text_soft())
             .child(content)
             .children(vault_prompt)
+            .children(encryption_setup)
+            .children(upload_options)
     }
 }
 
@@ -927,7 +960,7 @@ impl TDriveView {
                                     .label("Cancel")
                                     .on_click(move |_, _window, cx| {
                                         cancel_view.update(cx, |this, cx| {
-                                            this.state.close_vault_prompt();
+                                            this.state.cancel_vault_prompt();
                                             cx.notify();
                                         });
                                     }),
@@ -944,9 +977,301 @@ impl TDriveView {
         )
     }
 
-    // --- Application shell --------------------------------------------------
+    /// The first-time encryption setup, drawn over whatever is beneath it.
+    ///
+    /// The password is the drive's own, so it is asked for twice and guarded
+    /// with the original's warning; the hint travels with the config in the
+    /// clear, which the form says out loud.
+    fn render_encryption_setup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let setup = self.state.encryption_setup.as_ref()?;
+        let error = setup.error.clone();
+        let working = setup.working;
+        let view = cx.entity();
+        let submit_view = view.clone();
+        let cancel_view = view.clone();
 
-    fn render_app(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut confirm = Button::new("encrypt-confirm")
+            .primary()
+            .label("Set password");
+        if !working {
+            confirm = confirm.on_click(move |_, _window, cx| {
+                submit_encryption_setup(submit_view.clone(), cx);
+            });
+        }
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x05070dcc))
+                .child(
+                    div()
+                        .w(px(430.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .p(px(24.))
+                        .rounded(px(12.))
+                        .bg(theme::surface_1())
+                        .border_1()
+                        .border_color(theme::border_soft())
+                        .child(
+                            div()
+                                .text_size(px(theme::TYPE_MD))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::text())
+                                .child("Set an encryption password"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(theme::TYPE_SM))
+                                .text_color(theme::text_muted())
+                                .child(
+                                    "Use one password for every encrypted file in My Drive. \
+                                     If you forget it, encrypted files cannot be recovered.",
+                                ),
+                        )
+                        .child(text_field(&self.encrypt_password_input))
+                        .child(text_field(&self.encrypt_confirm_input))
+                        .child(text_field(&self.encrypt_hint_input))
+                        .child(
+                            div()
+                                .text_size(px(theme::TYPE_XS))
+                                .text_color(theme::text_subtle())
+                                .child(
+                                    "This hint is shown when TDrive asks for your encryption \
+                                     password. It is not encrypted, so don't put the password \
+                                     itself here.",
+                                ),
+                        )
+                        .children(error.map(error_banner))
+                        .child(
+                            div().flex().flex_row().gap(px(10.)).child(confirm).child(
+                                Button::new("encrypt-cancel")
+                                    .ghost()
+                                    .label("Cancel")
+                                    .on_click(move |_, _window, cx| {
+                                        cancel_view.update(cx, |this, cx| {
+                                            this.state.close_encryption_setup();
+                                            // Leaving the form is how a
+                                            // waiting encrypted upload is
+                                            // called off.
+                                            if this.state.pending_upload.is_some() {
+                                                this.state.pending_upload = None;
+                                                this.state.status = "Upload cancelled".to_string();
+                                            }
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                        )
+                        .children(working.then(|| {
+                            div()
+                                .text_size(px(theme::TYPE_SM))
+                                .text_color(theme::text_muted())
+                                .child("Deriving your key…")
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// "How would you like to upload?", the choice the original puts in front
+    /// of every upload to My Drive.
+    ///
+    /// The batch starts on plain every time: encryption is an explicit choice
+    /// per upload, never something remembered from the last one.
+    fn render_upload_options(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let options = self.state.upload_options.as_ref()?;
+        let summary = if options.count == 1 {
+            "Upload 1 file".to_string()
+        } else {
+            format!("Upload {} files", options.count)
+        };
+        let view = cx.entity();
+        let plain_view = view.clone();
+        let encrypt_view = view.clone();
+        let cancel_view = view.clone();
+        let confirm_view = view.clone();
+
+        let choice =
+            |id: &'static str, selected: bool, title: &'static str, body: &'static str| {
+                div()
+                    .id(id)
+                    .role(gpui::Role::RadioButton)
+                    .aria_label(title)
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(10.))
+                    .p(px(12.))
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if selected {
+                        theme::accent()
+                    } else {
+                        theme::border_soft()
+                    })
+                    .when(selected, |el| el.bg(theme::overlay_accent_1()))
+                    .hover(|style| style.bg(theme::panel()))
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .h(px(16.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(if selected {
+                                theme::accent()
+                            } else {
+                                theme::text_muted()
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .children(selected.then(|| {
+                                div().w(px(8.)).h(px(8.)).rounded_full().bg(theme::accent())
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(theme::TYPE_BASE))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text())
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(theme::TYPE_XS))
+                                    .text_color(theme::text_muted())
+                                    .child(body),
+                            ),
+                    )
+            };
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x05070dcc))
+                .child(
+                    div()
+                        .w(px(470.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .p(px(24.))
+                        .rounded(px(12.))
+                        .bg(theme::surface_1())
+                        .border_1()
+                        .border_color(theme::border_soft())
+                        .child(
+                            div()
+                                .text_size(px(theme::TYPE_MD))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::text())
+                                .child("How would you like to upload?"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(theme::TYPE_SM))
+                                .text_color(theme::text_muted())
+                                .child(summary),
+                        )
+                        .child(
+                            choice(
+                                "upload-mode-plain",
+                                !options.encrypt,
+                                "Upload",
+                                "Files are stored on Telegram as-is.",
+                            )
+                            .on_click({
+                                let view = plain_view;
+                                move |_, _window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.state.set_upload_encrypt(false);
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                        )
+                        .child(
+                            choice(
+                                "upload-mode-encrypt",
+                                options.encrypt,
+                                "Encrypt before upload",
+                                "TDrive encrypts file contents before sending them to Telegram. \
+                                 Names and folders stay visible.",
+                            )
+                            .on_click({
+                                let view = encrypt_view;
+                                move |_, _window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.state.set_upload_encrypt(true);
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(10.))
+                                .child(
+                                    Button::new("upload-options-confirm")
+                                        .primary()
+                                        .label("Continue")
+                                        .on_click({
+                                            let view = confirm_view;
+                                            move |_, _window, cx| {
+                                                submit_upload_options(view.clone(), cx);
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("upload-options-cancel")
+                                        .ghost()
+                                        .label("Cancel")
+                                        .on_click({
+                                            let view = cancel_view;
+                                            move |_, _window, cx| {
+                                                view.update(cx, |this, cx| {
+                                                    this.state.cancel_upload();
+                                                    this.state.status =
+                                                        "Upload cancelled".to_string();
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    // --- Application shell --------------------------------------------------
+    fn render_app(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex_1()
             .min_h_0()
@@ -1169,7 +1494,7 @@ impl TDriveView {
             .into_any_element()
     }
 
-    fn render_main(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
         let trash_mode = self.state.trash_mode();
         let photos_mode = self.state.photos_only();
@@ -1440,7 +1765,11 @@ impl TDriveView {
             .child(breadcrumb)
             .children(banner)
             .child(table_header)
-            .child(self.render_file_list(loading, cx))
+            .child(if photos_mode && !trash_mode {
+                self.render_gallery(loading, cx)
+            } else {
+                self.render_file_list(loading, cx)
+            })
             .into_any_element()
     }
 
@@ -1543,10 +1872,32 @@ impl TDriveView {
                 .id("file-list")
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
-                .px(px(10.))
+                .px(px(24.))
+                .py(px(16.))
                 .flex()
                 .flex_col()
+                .gap(px(14.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .text_size(px(theme::TYPE_MD))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::text())
+                                .child("Loading files..."),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(theme::TYPE_SM))
+                                .text_color(theme::text_muted())
+                                .child(
+                                    "Reading the drive's operations from Telegram.                                      Large drives can take a while the first time.",
+                                ),
+                        ),
+                )
                 .children((0..7).map(skeleton_row))
                 .into_any_element();
         }
@@ -1661,6 +2012,153 @@ impl TDriveView {
                     .child(body),
             )
             .into_any_element()
+    }
+
+    /// The photo gallery: a grid of thumbnails for the images in the active
+    /// drive or folder. Each tile fetches its own thumbnail on demand, so a
+    /// library is not downloaded in one go.
+    fn render_gallery(&mut self, loading: bool, cx: &mut Context<Self>) -> AnyElement {
+        if loading {
+            return div()
+                .id("gallery")
+                .flex_1()
+                .min_h_0()
+                .px(px(24.))
+                .py(px(16.))
+                .flex()
+                .flex_col()
+                .gap(px(14.))
+                .child(
+                    div()
+                        .text_size(px(theme::TYPE_MD))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text())
+                        .child("Loading photos..."),
+                )
+                .children((0..6).map(skeleton_row))
+                .into_any_element();
+        }
+
+        let rows = self.ordered_rows();
+        let indices: Vec<usize> = rows.iter().copied().collect();
+        let view = cx.entity();
+
+        if indices.is_empty() {
+            return self.empty_state().into_any_element();
+        }
+
+        let mut grid = div()
+            .id("gallery")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px(px(12.))
+            .py(px(12.))
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(8.));
+
+        for &index in &indices {
+            let file = self.state.files[index].clone();
+            let drive_id = self.state.active_dialog().map(|d| d.id).unwrap_or(0);
+            let message_id = file.message_id;
+            let encrypted = file.encrypted;
+            let key = self.state.vault.as_ref().and_then(|v| v.key);
+            let name = file.name.clone();
+
+            // The thumbnail is fetched once per tile; while it is on its way a
+            // placeholder keeps the grid stable.
+            let thumb = thumb_path(drive_id, message_id);
+            let exists = thumb.exists();
+            let downloading = self.state.gallery_downloads.contains(&message_id);
+
+            let tile_view = view.clone();
+            let thumb_for_click = thumb.clone();
+            let tile = div()
+                .w(px(152.))
+                .h(px(152.))
+                .flex_shrink_0()
+                .rounded(px(8.))
+                .overflow_hidden()
+                .bg(theme::surface_1())
+                .border_1()
+                .border_color(theme::border_soft())
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .when(!exists && !downloading, |el| {
+                    el.child(glyph(IconName::Image, 32., theme::text_muted()))
+                })
+                .when(exists, |el| {
+                    el.child(
+                        img(thumb.clone())
+                            .w(px(152.))
+                            .h(px(120.))
+                            .object_fit(ObjectFit::Cover),
+                    )
+                })
+                .child(
+                    div()
+                        .w_full()
+                        .px(px(6.))
+                        .py(px(4.))
+                        .text_size(px(theme::TYPE_XS))
+                        .text_color(theme::text_muted())
+                        .truncate()
+                        .child(name),
+                );
+
+            if !exists && !downloading {
+                self.state.gallery_downloads.insert(message_id);
+                let (client, peer_ref) = (
+                    self.state.tele.clone(),
+                    self.state.active_dialog().map(|d| d.peer_ref),
+                );
+                let thumb = thumb.clone();
+                let tile_view = tile_view.clone();
+                let encrypted = encrypted;
+                let key = key;
+                let message_id = message_id;
+                cx.defer(move |cx| {
+                    cx.spawn(async move |cx| {
+                        let result = cx
+                            .background_spawn(async move {
+                                if let Some(parent) = thumb.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                let (Some(client), Some(peer_ref)) = (client, peer_ref) else {
+                                    return;
+                                };
+                                let messages = vec![message_id];
+                                let key_for_task = if encrypted { key } else { None };
+                                let _ = tele::download_file(
+                                    &client,
+                                    peer_ref,
+                                    &messages,
+                                    &thumb,
+                                    key_for_task,
+                                );
+                            })
+                            .await;
+                        let _ = result;
+                        cx.update(|cx| {
+                            tile_view.update(cx, |this, cx| {
+                                this.state.gallery_downloads.remove(&message_id);
+                                cx.notify();
+                            });
+                        });
+                    })
+                    .detach();
+                });
+            }
+
+            let _ = thumb_for_click;
+            grid = grid.child(tile);
+        }
+
+        grid.into_any_element()
     }
 
     fn render_file_row(&self, index: usize, view: &Entity<TDriveView>) -> AnyElement {
@@ -2268,6 +2766,8 @@ enum LoginAction {
     /// Submit the passphrase in the unlock prompt, which is a form of its own
     /// rather than a step of the sign-in flow.
     UnlockVault,
+    /// Create the drive's encryption config from the setup form.
+    SubmitEncryptionSetup,
 }
 
 fn login_button(
@@ -2291,6 +2791,7 @@ fn run_login_action(view: Entity<TDriveView>, action: LoginAction, cx: &mut App)
         LoginAction::Verify => verify_login_code(view, cx),
         LoginAction::Unlock => unlock_two_factor(view, cx),
         LoginAction::UnlockVault => submit_vault_password(view, cx),
+        LoginAction::SubmitEncryptionSetup => submit_encryption_setup(view, cx),
     }
 }
 
@@ -2949,6 +3450,22 @@ fn spawn_write(
     done: String,
     cx: &mut App,
 ) {
+    spawn_write_keeping_key(view, ops, purge, done, None, cx);
+}
+
+/// [`spawn_write`], plus a key to hold on to once the re-read lands.
+///
+/// Setting up encryption writes the config and then re-reads the drive, which
+/// replaces the (previously absent) material with the new one. The key the user
+/// just chose belongs to that material, so it is put back after the read.
+fn spawn_write_keeping_key(
+    view: Entity<TDriveView>,
+    ops: Vec<Op>,
+    purge: Vec<String>,
+    done: String,
+    keep_key: Option<(VaultMaterial, [u8; 32])>,
+    cx: &mut App,
+) {
     let (client, peer_ref, drive_id, title) = {
         let this = view.read(cx);
         let Some(dialog) = this.state.active_dialog() else {
@@ -3010,27 +3527,46 @@ fn spawn_write(
                 }
             })
             .await;
-        cx.update(|cx| {
+        let resume_upload = cx.update(|cx| {
             view.update(cx, |this, cx| {
                 // The row may have moved, or the user may have moved to another
                 // drive, while the request was in flight.
                 if this.state.active_dialog().map(|d| d.id) != Some(drive_id) {
-                    return;
+                    return false;
                 }
-                match result {
+                let resume = match result {
                     Ok(contents) => {
                         apply_contents(&mut this.state, &title, Ok(contents));
+                        if let Some((material, key)) = keep_key.as_ref() {
+                            this.state.remember_vault_key(material, *key);
+                        }
+                        this.state.close_encryption_setup();
                         this.state.status = done;
+                        // An upload that was waiting for the key this write
+                        // has just made available is sent now.
+                        this.state.pending_upload.is_some()
                     }
                     Err(message) => {
                         this.state.files_loading = false;
-                        this.state.status = "Could not save".to_string();
-                        this.state.error = Some(message);
+                        // A failure that belongs to a form says so inside the
+                        // form, so the user can fix it without reopening it.
+                        if let Some(setup) = this.state.encryption_setup.as_mut() {
+                            setup.working = false;
+                            setup.error = Some(message);
+                        } else {
+                            this.state.status = "Could not save".to_string();
+                            this.state.error = Some(message);
+                        }
+                        false
                     }
-                }
+                };
                 cx.notify();
-            });
+                resume
+            })
         });
+        if resume_upload {
+            cx.update(|cx| advance_upload(view, cx));
+        }
     })
     .detach();
 }
@@ -3153,24 +3689,19 @@ fn spawn_download(view: Entity<TDriveView>, index: usize, cx: &mut App) {
 }
 
 fn spawn_upload(view: Entity<TDriveView>, cx: &mut App) {
-    let (client, peer_ref, parent) = {
+    let has_session = {
         let this = view.read(cx);
-        let (Some(client), Some(drive)) = (this.state.tele.clone(), this.state.active_dialog())
-        else {
-            // An upload has nothing to write to without a session, so say so
-            // rather than leaving the button looking inert.
-            view.update(cx, |this, cx| {
-                this.state.status = "Connect to Telegram to upload".to_string();
-                cx.notify();
-            });
-            return;
-        };
-        (
-            client,
-            drive.peer_ref,
-            this.state.current_folder().to_string(),
-        )
+        this.state.tele.is_some() && this.state.active_dialog().is_some()
     };
+    if !has_session {
+        // An upload has nothing to write to without a session, so say so
+        // rather than leaving the button looking inert.
+        view.update(cx, |this, cx| {
+            this.state.status = "Connect to Telegram to upload".to_string();
+            cx.notify();
+        });
+        return;
+    }
 
     view.update(cx, |this, cx| {
         this.state.status = "Choosing a file...".to_string();
@@ -3191,12 +3722,129 @@ fn spawn_upload(view: Entity<TDriveView>, cx: &mut App) {
             });
             return;
         };
-        cx.update(|cx| {
+        // Every upload to My Drive goes through the options modal, which is
+        // where "Encrypt before upload" lives, exactly as the original asks it.
+        // A shared drive has no such choice: its files are stored as they are.
+        let personal = cx.update(|cx| {
+            view.read(cx)
+                .state
+                .active_dialog()
+                .is_some_and(|drive| drive.kind == DriveKind::Personal)
+        });
+        if personal {
+            cx.update(|cx| {
+                view.update(cx, |this, cx| {
+                    this.state.begin_upload(path, 1);
+                    this.state.status = "Choose how to upload".to_string();
+                    cx.notify();
+                });
+            });
+        } else {
+            cx.update(|cx| spawn_upload_file(view, path, None, cx));
+        }
+    })
+    .detach();
+}
+
+/// Continue the pending upload now that its encryption is settled.
+///
+/// A plain batch goes straight out. An encrypted one needs the drive's key: a
+/// drive that has a config asks for its password, and a drive with no config
+/// yet is sent to the setup form, because encrypting requires creating one.
+fn advance_upload(view: Entity<TDriveView>, cx: &mut App) {
+    let (pending, key, has_config, has_session) = {
+        let this = view.read(cx);
+        let Some(pending) = this.state.pending_upload.clone() else {
+            return;
+        };
+        (
+            Some(pending),
+            this.state.vault.as_ref().and_then(|vault| vault.key),
+            this.state.vault.is_some(),
+            this.state.tele.is_some() && this.state.active_dialog().is_some(),
+        )
+    };
+    let Some(pending) = pending else {
+        return;
+    };
+    if !has_session {
+        view.update(cx, |this, cx| {
+            this.state.cancel_upload();
+            this.state.status = "Connect to Telegram to upload".to_string();
+            cx.notify();
+        });
+        return;
+    }
+
+    if pending.encrypt && key.is_none() {
+        view.update(cx, |this, cx| {
+            if has_config {
+                this.state.request_vault(None);
+                this.state.status = "Enter your encryption password".to_string();
+            } else {
+                this.state.open_encryption_setup();
+                this.state.status = "Set an encryption password".to_string();
+            }
+            cx.notify();
+        });
+        return;
+    }
+
+    // The batch is ready to go, so it stops being pending before the send
+    // starts: a second trigger must not upload the same file twice.
+    view.update(cx, |this, _cx| this.state.pending_upload = None);
+    spawn_upload_file(
+        view,
+        pending.path,
+        if pending.encrypt { key } else { None },
+        cx,
+    );
+}
+
+/// The upload options modal's Continue: keep the radio choice and continue.
+fn submit_upload_options(view: Entity<TDriveView>, cx: &mut App) {
+    let accepted = {
+        let this = view.read(cx);
+        this.state.upload_options.is_some()
+    };
+    if !accepted {
+        return;
+    }
+    view.update(cx, |this, cx| {
+        this.state.confirm_upload_choice();
+        cx.notify();
+    });
+    advance_upload(view, cx);
+}
+
+/// Send one chosen file into the folder on screen.
+///
+/// `key` is the drive's master key when the batch is to be encrypted, and
+/// `None` when its bytes go to Telegram as they are.
+fn spawn_upload_file(view: Entity<TDriveView>, path: PathBuf, key: Option<[u8; 32]>, cx: &mut App) {
+    let (client, peer_ref, parent) = {
+        let this = view.read(cx);
+        let (Some(client), Some(drive)) = (this.state.tele.clone(), this.state.active_dialog())
+        else {
             view.update(cx, |this, cx| {
-                this.state.status = format!("Uploading {}...", path.display());
+                this.state.status = "Connect to Telegram to upload".to_string();
                 cx.notify();
             });
-        });
+            return;
+        };
+        (
+            client,
+            drive.peer_ref,
+            this.state.current_folder().to_string(),
+        )
+    };
+
+    view.update(cx, |this, cx| {
+        this.state.status = format!("Uploading {}...", path.display());
+        cx.notify();
+    });
+
+    cx.spawn(async move |cx| {
         let label = path.display().to_string();
         // A file lands in the folder on screen and is named the way the
         // filesystem names it, because that name goes into the drive's own
@@ -3205,10 +3853,11 @@ fn spawn_upload(view: Entity<TDriveView>, cx: &mut App) {
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| "upload".to_string());
+        let upload_path = path.clone();
         let result = cx
-            .background_spawn(
-                async move { tele::upload_file(&client, peer_ref, &path, &parent, &name) },
-            )
+            .background_spawn(async move {
+                tele::upload_file(&client, peer_ref, &upload_path, &parent, &name, key)
+            })
             .await;
         let to_reload = cx.update(|cx| {
             view.update(cx, |this, cx| match result {
@@ -3218,6 +3867,7 @@ fn spawn_upload(view: Entity<TDriveView>, cx: &mut App) {
                     this.state.active_drive
                 }
                 Err(message) => {
+                    this.state.status = "Upload failed".to_string();
                     this.state.error = Some(message);
                     cx.notify();
                     None
@@ -3283,7 +3933,7 @@ fn submit_vault_password(view: Entity<TDriveView>, cx: &mut App) {
                     Ok(key) => {
                         vault.key = Some(key);
                         vault.error = None;
-                        vault.prompt.take().and_then(|prompt| prompt.message_id)
+                        vault.prompt.take()
                     }
                     Err(crypto::CryptoError::WrongPassword) => {
                         vault.error = Some("That encryption password is incorrect.".to_string());
@@ -3307,22 +3957,124 @@ fn submit_vault_password(view: Entity<TDriveView>, cx: &mut App) {
             })
         });
 
-        // Unlocking resumes the download the prompt interrupted, if there was
-        // one. The row is found by message id so this stays correct even if the
-        // list moved underneath it.
-        if let Some(message_id) = resume {
-            cx.update(|cx| {
-                let index = view
-                    .read(cx)
-                    .state
-                    .files
-                    .iter()
-                    .position(|file| file.message_id == message_id);
-                if let Some(index) = index {
-                    spawn_download(view, index, cx);
-                }
-            });
+        // Unlocking resumes whatever asked for the key: a download of a row, or
+        // an upload whose encryption was waiting on it. A download's row is
+        // found by message id so this stays correct even if the list moved
+        // underneath it.
+        if let Some(prompt) = resume {
+            if prompt.message_id.is_none() {
+                // No row asked for the key, so it was an upload: continue it.
+                cx.update(|cx| advance_upload(view, cx));
+                return;
+            }
+            if let Some(message_id) = prompt.message_id {
+                cx.update(|cx| {
+                    let index = view
+                        .read(cx)
+                        .state
+                        .files
+                        .iter()
+                        .position(|file| file.message_id == message_id);
+                    if let Some(index) = index {
+                        spawn_download(view, index, cx);
+                    }
+                });
+            }
         }
+    })
+    .detach();
+}
+
+/// Create the drive's encryption config from the setup form.
+///
+/// The rules are the original's: at least eight characters, typed twice, and an
+/// optional hint that travels in the clear. The config is one `encfg`
+/// operation; the master key it wraps stays in memory so the files the user
+/// uploads next are encrypted with it straight away.
+fn submit_encryption_setup(view: Entity<TDriveView>, cx: &mut App) {
+    let (password, confirm, hint) = {
+        let this = view.read(cx);
+        let Some(setup) = this.state.encryption_setup.as_ref() else {
+            return;
+        };
+        if setup.working {
+            return;
+        }
+        (
+            this.encrypt_password_input.read(cx).value().to_string(),
+            this.encrypt_confirm_input.read(cx).value().to_string(),
+            this.encrypt_hint_input.read(cx).value().to_string(),
+        )
+    };
+
+    let problem = if password.chars().count() < 8 {
+        Some("Use at least 8 characters.")
+    } else if password != confirm {
+        Some("Passwords don\u{2019}t match.")
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
+        view.update(cx, |this, cx| {
+            if let Some(setup) = this.state.encryption_setup.as_mut() {
+                setup.error = Some(problem.to_string());
+            }
+            cx.notify();
+        });
+        return;
+    }
+
+    // Without a session, or with no drive open, there is nothing to write the
+    // config to; the button that opens this form is only drawn with both.
+    if view.read(cx).state.tele.is_none() || view.read(cx).state.active_dialog().is_none() {
+        return;
+    }
+
+    view.update(cx, |this, cx| {
+        if let Some(setup) = this.state.encryption_setup.as_mut() {
+            setup.working = true;
+            setup.error = None;
+        }
+        cx.notify();
+    });
+
+    cx.spawn(async move |cx| {
+        // The KDF is deliberately slow, so the config is built off the UI
+        // thread before anything is written to the drive.
+        let created = cx
+            .background_spawn(async move {
+                let hint = hint.trim().to_string();
+                crypto::create_vault(&password, &hint).map(|(material, key)| (material, key, hint))
+            })
+            .await;
+
+        let (material, key, hint) = match created {
+            Ok(created) => created,
+            Err(error) => {
+                cx.update(|cx| {
+                    view.update(cx, |this, cx| {
+                        if let Some(setup) = this.state.encryption_setup.as_mut() {
+                            setup.working = false;
+                            setup.error = Some(format!("Could not set up encryption: {error}"));
+                        }
+                        cx.notify();
+                    });
+                });
+                return;
+            }
+        };
+
+        let op = tele::enc_config_op(&material, &hint);
+        cx.update(|cx| {
+            spawn_write_keeping_key(
+                view,
+                vec![op],
+                Vec::new(),
+                "Encryption is on for this drive".to_string(),
+                Some((material, key)),
+                cx,
+            );
+        });
     })
     .detach();
 }
@@ -3543,6 +4295,15 @@ fn empty_trash(view: Entity<TDriveView>, cx: &mut App) {
         format!("Emptied the trash ({count} items)"),
         cx,
     );
+}
+
+fn thumb_path(drive_id: i64, message_id: i32) -> PathBuf {
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.cache_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("tdrive")
+        .join("thumbs")
+        .join(format!("{drive_id}_{message_id}"))
 }
 
 fn download_dir() -> PathBuf {

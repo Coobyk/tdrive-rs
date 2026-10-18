@@ -105,9 +105,13 @@ forgotten on a drive switch or logout.
   key or a truncated transfer never leaves a half-written file behind, and a
   wrong passphrase reports itself instead of corrupting the destination.
 - **Upload and delete** — uploads are sent as `t=f` operations, which the
-  original reads. Delete is the drive's own trash, not a Telegram deletion: the
-  port publishes the `trash` operation the original publishes, so the file keeps
-  its bytes and its retention window and is restorable from either app.
+  original reads. Every upload opens the original's "How would you like to
+  upload?" choice, so a batch can be encrypted before it is sent; a drive with
+  no encryption config yet is walked through the original's password setup
+  first, and the master key it creates stays in memory for the session. Delete
+  is the drive's own trash, not a Telegram deletion: the port publishes the
+  `trash` operation the original publishes, so the file keeps its bytes and its
+  retention window and is restorable from either app.
 - **Trash** — the drive's own trash is read from its operations, so items
   deleted by the original app appear here with their origin and countdown, and
   the port's own deletions join them. Restore and purge are written back as
@@ -131,8 +135,8 @@ Stated plainly, because the original does all of this and this port does not:
 - **The rest of the write surface.** `mkdir` (a new folder) and the classic
   `rename` / `move` namespace updates are formatted and parsed, but nothing in
   the shell drives them yet, and the writable-mount operations (`fcommit`,
-  `freplace`, `relocate`) are replayed but never written: uploads still send the
-  older single-message `t=f` form.
+  `freplace`, `relocate`) are replayed but never written: uploads still send
+  the single-message `t=f` form, encrypted or plain.
 - **Gallery, viewers, WebDAV mount, photo backup, transfers, desktop updates** —
   none of it.
 - **New shared drive / Join with link** report that they are unconnected rather

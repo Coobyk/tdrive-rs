@@ -359,14 +359,6 @@ impl Default for LoginFlow {
     }
 }
 
-/// Why the encryption prompt is on screen. Only one prompt exists at a time, so
-/// a newer request replaces an older one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VaultPrompt {
-    /// The encrypted row that asked for the key, when a file was being opened.
-    pub message_id: Option<i32>,
-}
-
 /// The drive's encryption config, and the key once the user has unlocked it.
 ///
 /// The key lives here for the app session only; nothing about it is written to
@@ -377,6 +369,42 @@ pub struct Vault {
     pub hint: String,
     pub key: Option<[u8; 32]>,
     pub prompt: Option<VaultPrompt>,
+    pub error: Option<String>,
+    pub working: bool,
+}
+
+/// Why the encryption prompt is on screen. Only one prompt exists at a time, so
+/// a newer request replaces an older one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultPrompt {
+    /// The encrypted row that asked for the key, when a file was being opened.
+    pub message_id: Option<i32>,
+}
+
+/// The "How would you like to upload?" choice, while it is on screen.
+///
+/// The original asks this for every upload batch and starts on plain every
+/// time: encryption is chosen per batch rather than remembered from the last.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadOptions {
+    /// How many files the batch holds; the modal's summary names the count.
+    pub count: usize,
+    /// The choice being made, starting on plain.
+    pub encrypt: bool,
+}
+
+/// A chosen file waiting for the upload modal, the encryption password, or the
+/// encryption setup to be settled before it is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUpload {
+    pub path: PathBuf,
+    /// Whether this batch is to be encrypted before it is sent.
+    pub encrypt: bool,
+}
+
+/// First-time encryption setup, while the modal is open.
+#[derive(Debug, Clone, Default)]
+pub struct EncryptionSetup {
     pub error: Option<String>,
     pub working: bool,
 }
@@ -476,8 +504,17 @@ pub struct AppState {
     /// does not re-sort the folder (which the original memoises for the same
     /// reason: a folder can hold six figures of entries).
     pub rows_version: u64,
+    /// Message ids whose thumbnail is currently being fetched for the gallery,
+    /// so the tile is not asked to download the same image twice.
+    pub gallery_downloads: std::collections::HashSet<i32>,
     /// The drive's encryption config and session key, when it has one.
     pub vault: Option<Vault>,
+    /// First-time encryption setup, while its modal is open.
+    pub encryption_setup: Option<EncryptionSetup>,
+    /// The upload options modal, while it is open.
+    pub upload_options: Option<UploadOptions>,
+    /// The file a modal or a password prompt is standing in for.
+    pub pending_upload: Option<PendingUpload>,
     /// True when the shell is running on [`AppState::seed_demo`] data rather
     /// than a live Telegram session (`TDRIVE_DEMO=1`). Mutating actions take a
     /// local path in this mode so the flows stay walkable without credentials.
@@ -525,7 +562,11 @@ impl Default for AppState {
             sort: SortState::default(),
             view: ViewMode::default(),
             rows_version: 0,
+            gallery_downloads: std::collections::HashSet::new(),
             vault: None,
+            encryption_setup: None,
+            upload_options: None,
+            pending_upload: None,
             demo: false,
             trash: Vec::new(),
             pending_delete: None,
@@ -671,11 +712,92 @@ impl AppState {
         }
     }
 
+    /// Take a chosen file to the upload options modal.
+    pub fn begin_upload(&mut self, path: PathBuf, count: usize) {
+        self.pending_upload = Some(PendingUpload {
+            path,
+            encrypt: false,
+        });
+        self.upload_options = Some(UploadOptions {
+            count,
+            encrypt: false,
+        });
+    }
+
+    /// Keep the modal's radio choice while it is open.
+    pub fn set_upload_encrypt(&mut self, encrypt: bool) {
+        if let Some(options) = self.upload_options.as_mut() {
+            options.encrypt = encrypt;
+        }
+    }
+
+    /// Close the upload options modal, whoever closed it.
+    pub fn close_upload_options(&mut self) {
+        self.upload_options = None;
+    }
+
+    /// Accept the modal's choice for the file that is waiting, and report
+    /// whether it is the encrypt choice. The radio is only a preference until
+    /// this runs, so a cancelled modal changes nothing.
+    pub fn confirm_upload_choice(&mut self) -> bool {
+        let encrypt = self
+            .upload_options
+            .as_ref()
+            .is_some_and(|options| options.encrypt);
+        self.upload_options = None;
+        if let Some(pending) = self.pending_upload.as_mut() {
+            pending.encrypt = encrypt;
+        }
+        encrypt
+    }
+
+    pub fn cancel_upload(&mut self) {
+        self.close_upload_options();
+        self.pending_upload = None;
+    }
+
+    /// Open the first-time encryption setup.
+    pub fn open_encryption_setup(&mut self) {
+        self.encryption_setup = Some(EncryptionSetup::default());
+        self.error = None;
+    }
+
+    pub fn close_encryption_setup(&mut self) {
+        self.encryption_setup = None;
+    }
+
+    /// Hold a key that was just created for `material`.
+    ///
+    /// Creating the config sends an `encfg` op and re-reads the drive, which
+    /// installs the new material as a locked vault. The key the user just
+    /// chose is theirs to keep, so it is put back once that material lands.
+    pub fn remember_vault_key(&mut self, material: &VaultMaterial, key: [u8; 32]) {
+        if let Some(vault) = self.vault.as_mut() {
+            if vault.material == *material {
+                vault.key = Some(key);
+            }
+        }
+    }
+
     pub fn close_vault_prompt(&mut self) {
         if let Some(vault) = self.vault.as_mut() {
             vault.prompt = None;
             vault.error = None;
             vault.working = false;
+        }
+    }
+
+    /// Dismiss the passphrase prompt, and with it any upload that was waiting
+    /// for the key: cancelling the prompt is how the user says no to it.
+    pub fn cancel_vault_prompt(&mut self) {
+        let was_upload = self
+            .vault
+            .as_ref()
+            .and_then(|vault| vault.prompt.as_ref())
+            .is_some_and(|prompt| prompt.message_id.is_none());
+        self.close_vault_prompt();
+        if was_upload {
+            self.pending_upload = None;
         }
     }
 
@@ -1156,6 +1278,65 @@ fn split_extension(name: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The upload flow's bookkeeping: a chosen file waits behind the options
+    /// modal, the choice is kept per batch, and leaving the flow drops it.
+    #[test]
+    fn upload_options_track_the_batch_and_start_plain() {
+        let mut state = AppState::default();
+        state.begin_upload(PathBuf::from("/tmp/report.pdf"), 1);
+        assert_eq!(
+            state.upload_options,
+            Some(UploadOptions {
+                count: 1,
+                encrypt: false
+            })
+        );
+        assert_eq!(
+            state.pending_upload.as_ref().map(|p| p.encrypt),
+            Some(false)
+        );
+
+        state.set_upload_encrypt(true);
+        assert!(state.upload_options.is_some());
+        // Only accepting the choice passes it on to the file; a cancelled
+        // modal would leave the pending upload plain.
+        assert!(state.confirm_upload_choice());
+        assert!(state.upload_options.is_none());
+        assert_eq!(state.pending_upload.as_ref().map(|p| p.encrypt), Some(true));
+
+        state.cancel_upload();
+        assert!(state.pending_upload.is_none());
+    }
+
+    /// Cancelling the passphrase prompt drops the upload that was waiting for
+    /// it, but leaves a download (a prompt that names a row) alone.
+    #[test]
+    fn cancelling_a_vault_prompt_drops_only_a_waiting_upload() {
+        let material = VaultMaterial {
+            salt: vec![0; 16],
+            params_json: "{}".to_string(),
+            wrapped_master_key: vec![0; 72],
+            key_check: vec![0; 59],
+        };
+        let mut state = AppState::default();
+        state.set_vault(Some((material.clone(), "hint".to_string())));
+        state.pending_upload = Some(PendingUpload {
+            path: PathBuf::from("/tmp/report.pdf"),
+            encrypt: true,
+        });
+        state.request_vault(None);
+        state.cancel_vault_prompt();
+        assert!(state.pending_upload.is_none());
+
+        state.pending_upload = Some(PendingUpload {
+            path: PathBuf::from("/tmp/report.pdf"),
+            encrypt: true,
+        });
+        state.request_vault(Some(42));
+        state.cancel_vault_prompt();
+        assert!(state.pending_upload.is_some());
+    }
 
     fn file(message_id: i32, name: &str, size: i64, parent: &str) -> RemoteFile {
         RemoteFile {
