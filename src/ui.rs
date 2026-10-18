@@ -2095,7 +2095,10 @@ impl TDriveView {
         let row_count = gallery_rows.len();
         let rows = std::rc::Rc::new(gallery_rows);
 
-        uniform_list("gallery", row_count, move |range, _window, cx| {
+        div()
+            .flex_1()
+            .min_h_0()
+            .child(uniform_list("gallery", row_count, move |range, _window, cx| {
             let this = view.read(cx);
             let rows = rows.clone();
             range
@@ -2210,7 +2213,7 @@ impl TDriveView {
                     }
                 })
                 .collect::<Vec<_>>()
-        })
+        }))
         .into_any_element()
     }
     fn render_file_row(&self, index: usize, view: &Entity<TDriveView>) -> AnyElement {
