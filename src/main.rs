@@ -1,6 +1,9 @@
+mod config;
+mod crypto;
 mod db;
 mod format;
 mod models;
+mod ops;
 mod tele;
 mod theme;
 mod ui;

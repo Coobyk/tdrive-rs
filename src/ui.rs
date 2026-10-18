@@ -6,29 +6,53 @@
 //! Actions file table. Colours come from [`crate::theme`], which carries the
 //! original palette, so nothing renders light-on-light.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, IntoElement, ParentElement, Render, Rgba,
-    SharedString, Styled, Subscription, Window, div, px,
+    SharedString, Styled, Subscription, Window, div, px, uniform_list,
 };
 use gpui_component::{
-    Icon,
+    Disableable, Icon,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
 };
 use gpui_kit_assets::IconName;
 
+use crate::config::{self, DEFAULT_CHANNEL_ABOUT, DEFAULT_CHANNEL_TITLE, DriveConfig, StoredDrive};
+use crate::crypto;
 use crate::format::{entry_origin, human_size, purge_countdown, short_date};
 use crate::models::{
-    AppState, DialogKind, FileKind, LocalState, LoginStep, RemoteFile, SortKey, SortState, ViewMode,
+    AppState, ContentRef, Drive, DriveCandidate, DriveKind, FileKind, LocalState, LoginStep,
+    RemoteFile, SortKey, SortState, TrashEntry, ViewMode,
 };
 use crate::tele;
 use crate::theme;
 
 type TeleClient = grammers_client::Client;
+
+/// The ordered row indices a frame draws, remembered until something that can
+/// change them changes.
+///
+/// The original memoises the same thing for the same reason: a folder can hold
+/// six figures of entries, and re-filtering and re-sorting all of them on every
+/// scroll tick would be visible.
+struct RowsCache {
+    version: u64,
+    view: ViewMode,
+    drive: Option<usize>,
+    folder: String,
+    trash: bool,
+    rows: Rc<Vec<usize>>,
+    /// The drive's stored bytes at this version. Summing every file on each
+    /// redraw would put the one remaining O(files) walk back into the frame
+    /// that the row window exists to avoid, so it is memoised with the rows.
+    total_size: i64,
+}
 
 pub struct TDriveView {
     state: AppState,
@@ -38,6 +62,9 @@ pub struct TDriveView {
     code_input: Entity<InputState>,
     password_input: Entity<InputState>,
     search_input: Entity<InputState>,
+    /// The passphrase field in the "Unlock encrypted files" prompt.
+    vault_input: Entity<InputState>,
+    rows_cache: RefCell<Option<RowsCache>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -51,6 +78,13 @@ impl TDriveView {
         let password_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Two-factor password"));
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search files..."));
+        let vault_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Encryption password"));
+
+        // Secrets render as dots and stay out of the clipboard, the way the
+        // original treats the two-factor password and the passphrase.
+        password_input.update(cx, |state, cx| state.set_masked(true, window, cx));
+        vault_input.update(cx, |state, cx| state.set_masked(true, window, cx));
 
         let mut this = Self {
             state: AppState::default(),
@@ -60,6 +94,8 @@ impl TDriveView {
             code_input,
             password_input,
             search_input,
+            vault_input,
+            rows_cache: RefCell::new(None),
             _subscriptions: Vec::new(),
         };
 
@@ -68,18 +104,69 @@ impl TDriveView {
         // Telegram session.
         if std::env::var("TDRIVE_DEMO").is_ok() {
             this.state.seed_demo();
+        } else if let Some(creds) = config::load_credentials() {
+            // The setup screen arrives filled in, because the credentials were
+            // already given to this machine, exactly as the original's
+            // `imp_config.json` remembers them.
+            this.api_id_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("API ID (from my.telegram.org)")
+                    .default_value(creds.api_id.to_string())
+            });
+            this.api_hash_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("API hash")
+                    .default_value(creds.api_hash.clone())
+            });
         }
 
         let subscription = cx.subscribe(
             &this.search_input,
             |this: &mut Self, _emitter, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
-                    this.state.query = this.search_input.read(cx).value().to_string();
+                    let query = this.search_input.read(cx).value().to_string();
+                    this.state.set_query(query);
                     cx.notify();
                 }
             },
         );
         this._subscriptions.push(subscription);
+
+        // Enter submits, as it does in every form the original draws: the same
+        // key advances each sign-in step and unlocks the vault. The action is
+        // deferred because this handler already runs inside this view's update,
+        // and starting one of these tasks here would lease the view twice.
+        let weak = cx.weak_entity();
+        for (input, action) in [
+            (this.api_id_input.clone(), LoginAction::Connect),
+            (this.api_hash_input.clone(), LoginAction::Connect),
+            (this.phone_input.clone(), LoginAction::SendCode),
+            (this.code_input.clone(), LoginAction::Verify),
+            (this.password_input.clone(), LoginAction::Unlock),
+            (this.vault_input.clone(), LoginAction::UnlockVault),
+        ] {
+            let weak = weak.clone();
+            let subscription = cx.subscribe(
+                &input,
+                move |_this: &mut Self, _emitter, event: &InputEvent, cx| {
+                    let submits = matches!(
+                        event,
+                        InputEvent::PressEnter {
+                            secondary: false,
+                            shift: false
+                        }
+                    );
+                    if !submits {
+                        return;
+                    }
+                    let Some(view) = weak.upgrade() else {
+                        return;
+                    };
+                    cx.defer(move |cx| run_login_action(view, action, cx));
+                },
+            );
+            this._subscriptions.push(subscription);
+        }
         this
     }
 }
@@ -124,6 +211,22 @@ fn drive_empty(text: &'static str) -> impl IntoElement {
         .text_color(theme::text_muted())
         .opacity(0.6)
         .child(text)
+}
+
+/// A failed action, shown inside a card rather than as a status line so it is
+/// hard to miss and impossible to confuse with progress.
+fn error_banner(message: String) -> AnyElement {
+    div()
+        .rounded(px(8.))
+        .bg(theme::overlay_danger_1())
+        .border_1()
+        .border_color(theme::overlay_danger_2())
+        .px(px(12.))
+        .py(px(8.))
+        .text_size(px(theme::TYPE_SM))
+        .text_color(theme::danger())
+        .child(message)
+        .into_any_element()
 }
 
 /// One row in a sidebar list: an 18px glyph, then the title.
@@ -316,18 +419,23 @@ fn row_action(
 
 impl Render for TDriveView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = if self.state.login.step == LoginStep::LoggedIn {
-            self.render_app(cx).into_any_element()
-        } else {
-            self.render_login(cx).into_any_element()
+        let content = match self.state.login.step {
+            LoginStep::LoggedIn => self.render_app(cx).into_any_element(),
+            // Signed in but nothing saved on this device yet: the original asks
+            // which channel is the drive before it shows any files.
+            LoginStep::ChooseDrive => self.render_drive_picker(cx),
+            _ => self.render_login(cx).into_any_element(),
         };
+        let vault_prompt = self.render_vault_prompt(cx);
         div()
             .size_full()
             .flex()
             .flex_col()
+            .relative()
             .bg(theme::canvas())
             .text_color(theme::text_soft())
             .child(content)
+            .children(vault_prompt)
     }
 }
 
@@ -381,6 +489,7 @@ impl TDriveView {
                 vec![field("PASSWORD", text_field(&self.password_input))],
             ),
             LoginStep::LoggedIn => ("", "", Vec::new()),
+            LoginStep::ChooseDrive => ("", "", Vec::new()),
         };
 
         let action = match step {
@@ -400,6 +509,7 @@ impl TDriveView {
                 login_button("unlock", "Unlock", view.clone(), LoginAction::Unlock)
             }
             LoginStep::LoggedIn => Button::new("noop").ghost(),
+            LoginStep::ChooseDrive => Button::new("noop").ghost(),
         };
 
         div()
@@ -461,6 +571,371 @@ impl TDriveView {
             )
     }
 
+    /// The "Choose your TDrive" step, shown when no drive is saved on this
+    /// device yet.
+    ///
+    /// Only the account's own broadcast channels appear here, because only a
+    /// broadcast channel the account created can hold a drive. Private chats,
+    /// groups and channels the account merely follows are filtered out in the
+    /// transport, so this screen cannot offer a chat that is not a drive.
+    fn render_drive_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity();
+        let loading = self.state.candidates_loading;
+        let working = self.state.selecting_drive;
+        let error = self.state.candidates_error.clone();
+        let selected = self.state.selected_candidate;
+
+        let candidates: Vec<AnyElement> = self
+            .state
+            .candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let row_view = view.clone();
+                let active = selected == Some(index);
+                let meta = {
+                    let created = chrono::DateTime::from_timestamp(candidate.created, 0);
+                    // The original's order: whether the channel is in use, then
+                    // when it was created, then its id.
+                    let activity = if candidate.has_activity {
+                        "In use"
+                    } else {
+                        "Empty"
+                    };
+                    format!(
+                        "{} · Created {} · ID {}",
+                        activity,
+                        short_date(created),
+                        candidate.id
+                    )
+                };
+                let title = if candidate.title.trim().is_empty() {
+                    "Untitled channel".to_string()
+                } else {
+                    candidate.title.clone()
+                };
+                div()
+                    .id(SharedString::from(format!("candidate-{index}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.))
+                    .px(px(12.))
+                    .py(px(10.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(if active {
+                        theme::accent()
+                    } else {
+                        theme::border_soft()
+                    })
+                    .bg(if active {
+                        theme::overlay_accent_1()
+                    } else {
+                        theme::surface_2()
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::overlay_2()))
+                    .on_click(move |_, _window, cx| {
+                        select_candidate(row_view.clone(), index, cx);
+                    })
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .h(px(16.))
+                            .flex_shrink_0()
+                            .rounded(px(999.))
+                            .border_1()
+                            .border_color(if active {
+                                theme::accent()
+                            } else {
+                                theme::border()
+                            })
+                            .when(active, |el| el.bg(theme::accent())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(theme::TYPE_BASE))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::text())
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(theme::TYPE_XS))
+                                    .text_color(theme::text_muted())
+                                    .child(meta),
+                            ),
+                    )
+                    .children(candidate.recommended.then(|| {
+                        div()
+                            .flex_shrink_0()
+                            .px(px(8.))
+                            .py(px(2.))
+                            .rounded(px(999.))
+                            .bg(theme::overlay_accent_1())
+                            .text_size(px(theme::TYPE_XS))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::accent())
+                            .child("Recommended")
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+
+        let continue_view = view.clone();
+        let create_view = view.clone();
+        let cancel_view = view.clone();
+        let confirm_view = view.clone();
+        let confirming = self.state.confirming_create;
+        let continue_button = Button::new("continue-drive")
+            .primary()
+            .label(if working { "Recovering…" } else { "Continue" })
+            .loading(working)
+            .disabled(selected.is_none() || working)
+            .on_click(move |_, _window, cx| {
+                continue_with_candidate(continue_view.clone(), cx);
+            });
+
+        // Creating a drive makes a channel on the account, so it is confirmed
+        // first, exactly as the original's two-step button is.
+        let create_button = Button::new("create-drive")
+            .ghost()
+            .label("Create New TDrive")
+            .disabled(working)
+            .on_click(move |_, _window, cx| {
+                request_create_drive(create_view.clone(), cx);
+            });
+        let confirm_button = Button::new("create-drive-confirm")
+            .primary()
+            .label("Create")
+            .disabled(working)
+            .on_click(move |_, _window, cx| {
+                create_personal_drive(confirm_view.clone(), cx);
+            });
+        let cancel_button = Button::new("create-drive-cancel")
+            .ghost()
+            .label("Cancel")
+            .disabled(working)
+            .on_click(move |_, _window, cx| {
+                cancel_create_drive(cancel_view.clone(), cx);
+            });
+
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(520.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(18.))
+                    .p(px(28.))
+                    .rounded(px(12.))
+                    .bg(theme::surface_1())
+                    .border_1()
+                    .border_color(theme::border_soft())
+                    .child(self.brand())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(theme::TYPE_MD))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text())
+                                    .child("Choose your TDrive"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(theme::TYPE_SM))
+                                    .text_color(theme::text_muted())
+                                    .child(
+                                        "No saved drive was found on this device. Pick the \
+                                         Telegram channel that holds your files, or start a new \
+                                         empty drive.",
+                                    ),
+                            ),
+                    )
+                    .children(error.map(error_banner))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.))
+                            .children(loading.then(|| drive_empty("Looking for your drives…")))
+                            .children((!loading && candidates.is_empty()).then(|| {
+                                drive_empty(
+                                    "No channels found. You haven't created any Telegram \
+                                     channels, so there is nothing to recover yet.",
+                                )
+                            }))
+                            .children(candidates),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(10.))
+                            .child(continue_button)
+                            .children((!confirming).then_some(create_button)),
+                    )
+                    .children(confirming.then(|| {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.))
+                            .p(px(12.))
+                            .rounded(px(10.))
+                            .bg(theme::surface_2())
+                            .border_1()
+                            .border_color(theme::border_soft())
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::TYPE_SM))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme::text())
+                                            .child("Create a new empty TDrive?"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::TYPE_XS))
+                                            .text_color(theme::text_muted())
+                                            .child("This creates one new Telegram channel."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(8.))
+                                    .child(cancel_button)
+                                    .child(confirm_button),
+                            )
+                    }))
+                    .children(working.then(|| {
+                        div()
+                            .text_size(px(theme::TYPE_SM))
+                            .text_color(theme::text_muted())
+                            .child("Preparing your drive…")
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// The prompt an encrypted file raises when the drive's key is not in
+    /// memory yet.
+    ///
+    /// The wording is the original's: it says what the key is for and shows the
+    /// hint the drive carries, so a forgotten password is not a dead end.
+    fn render_vault_prompt(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let vault = self.state.vault.as_ref()?;
+        vault.prompt.as_ref()?;
+        let hint = vault.hint.trim().to_string();
+        let error = vault.error.clone();
+        let working = vault.working;
+        let view = cx.entity();
+        let unlock_view = view.clone();
+        let cancel_view = view.clone();
+
+        let mut unlock = Button::new("vault-unlock").primary().label("Unlock");
+        if !working {
+            unlock = unlock.on_click(move |_, _window, cx| {
+                submit_vault_password(unlock_view.clone(), cx);
+            });
+        }
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x05070dcc))
+                .child(
+                    div()
+                        .w(px(390.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(14.))
+                        .p(px(24.))
+                        .rounded(px(12.))
+                        .bg(theme::surface_1())
+                        .border_1()
+                        .border_color(theme::border_soft())
+                        .child(
+                            div()
+                                .text_size(px(theme::TYPE_MD))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::text())
+                                .child("Unlock encrypted files"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(theme::TYPE_SM))
+                                .text_color(theme::text_muted())
+                                .child(
+                                    "This drive stores encrypted files. Enter your encryption \
+                                     password to open them.",
+                                ),
+                        )
+                        .children((!hint.is_empty()).then(|| {
+                            div()
+                                .text_size(px(theme::TYPE_XS))
+                                .text_color(theme::text_subtle())
+                                .child(format!("Hint: {hint}"))
+                        }))
+                        .child(text_field(&self.vault_input))
+                        .children(error.map(error_banner))
+                        .child(
+                            div().flex().flex_row().gap(px(10.)).child(unlock).child(
+                                Button::new("vault-cancel")
+                                    .ghost()
+                                    .label("Cancel")
+                                    .on_click(move |_, _window, cx| {
+                                        cancel_view.update(cx, |this, cx| {
+                                            this.state.close_vault_prompt();
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                        )
+                        .children(working.then(|| {
+                            div()
+                                .text_size(px(theme::TYPE_SM))
+                                .text_color(theme::text_muted())
+                                .child("Deriving your key…")
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
     // --- Application shell --------------------------------------------------
 
     fn render_app(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -478,15 +953,16 @@ impl TDriveView {
         let (personal, shared, active) = {
             let state = &self.state;
             (
-                drive_rows(state, DialogKind::Personal),
-                drive_rows(state, DialogKind::Shared),
+                drive_rows(state, true),
+                drive_rows(state, false),
                 state.active_drive,
             )
         };
+        let shared_empty = shared.is_empty();
         let view_mode = self.state.view;
-        let loading = self.state.dialogs_loading;
+        let loading = self.state.drives_loading;
         let status = self.state.status.clone();
-        let used = self.state.total_size();
+        let used = self.drive_size();
 
         let personal_items: Vec<AnyElement> = personal
             .into_iter()
@@ -538,7 +1014,7 @@ impl TDriveView {
                         view_mode == ViewMode::Photos,
                         move |cx| {
                             photos_view.update(cx, |this, cx| {
-                                this.state.view = ViewMode::Photos;
+                                this.state.set_view(ViewMode::Photos);
                                 this.state.pending_delete = None;
                                 this.state.pending_purge = None;
                                 this.state.confirm_empty_trash = false;
@@ -553,7 +1029,7 @@ impl TDriveView {
                         view_mode == ViewMode::Trash,
                         move |cx| {
                             trash_view.update(cx, |this, cx| {
-                                this.state.view = ViewMode::Trash;
+                                this.state.set_view(ViewMode::Trash);
                                 this.state.pending_delete = None;
                                 this.state.pending_purge = None;
                                 this.state.confirm_empty_trash = false;
@@ -581,8 +1057,7 @@ impl TDriveView {
                     .children(shared_items)
                     .children(loading.then(|| drive_empty("Loading...")))
                     .children(
-                        (!loading && self.state.dialogs.is_empty())
-                            .then(|| drive_empty("No shared drives yet")),
+                        (!loading && shared_empty).then(|| drive_empty("No shared drives yet")),
                     ),
             );
 
@@ -690,13 +1165,9 @@ impl TDriveView {
         let view = cx.entity();
         let trash_mode = self.state.trash_mode();
         let photos_mode = self.state.photos_only();
-        let (title, loading, can_upload, error) = {
+        let (loading, can_upload, error) = {
             let state = &self.state;
             (
-                state
-                    .active_dialog()
-                    .map(|d| d.title.clone())
-                    .unwrap_or_else(|| "My Drive".to_string()),
                 state.files_loading,
                 state.active_drive.is_some() && !trash_mode,
                 state.error.clone(),
@@ -765,7 +1236,12 @@ impl TDriveView {
                     })),
             );
 
+        // Back walks one folder up the trail; at the drive root there is
+        // nowhere to go, so it dims rather than disappearing.
+        let can_go_back = self.state.folder.len() > 1;
+        let back_view = view.clone();
         let back = div()
+            .id("folder-back")
             .w(px(32.))
             .h(px(32.))
             .flex_shrink_0()
@@ -773,32 +1249,56 @@ impl TDriveView {
             .items_center()
             .justify_center()
             .rounded(px(6.))
-            .opacity(0.35)
+            .opacity(if can_go_back { 1.0 } else { 0.35 })
+            .when(can_go_back, |el| {
+                el.cursor_pointer()
+                    .hover(|style| style.bg(theme::overlay_2()))
+                    .on_click(move |_, _window, cx| {
+                        back_view.update(cx, |this, cx| {
+                            let target = this.state.folder.len().saturating_sub(2);
+                            this.state.go_to_crumb(target);
+                            cx.notify();
+                        });
+                    })
+            })
             .child(glyph(IconName::ChevronLeft, 18., theme::text_soft()));
 
-        let trail = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.))
-            .min_w_0()
-            .child(
+        // The trail is the drive's own path, so a nested folder can be left by
+        // clicking any earlier step rather than only by Back.
+        let mut trail = div().flex().flex_row().items_center().gap(px(8.)).min_w_0();
+        let crumbs = self.state.folder.clone();
+        for (index, crumb) in crumbs.iter().enumerate() {
+            if index > 0 {
+                trail = trail.child(div().text_color(theme::text_muted()).child("/"));
+            }
+            let last = index + 1 == crumbs.len();
+            let crumb_view = view.clone();
+            let label = crumb.name.clone();
+            trail = trail.child(
                 div()
-                    .text_size(px(theme::TYPE_BASE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::text())
-                    .child("My Drive"),
-            )
-            .child(div().text_color(theme::text_muted()).child("/"))
-            .child(
-                div()
+                    .id(SharedString::from(format!("crumb-{index}")))
                     .min_w_0()
                     .truncate()
                     .text_size(px(theme::TYPE_BASE))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::text())
-                    .child(title.clone()),
+                    .text_color(if last {
+                        theme::text()
+                    } else {
+                        theme::text_soft()
+                    })
+                    .when(!last, |el| {
+                        el.cursor_pointer()
+                            .hover(|style| style.text_color(theme::accent()))
+                            .on_click(move |_, _window, cx| {
+                                crumb_view.update(cx, |this, cx| {
+                                    this.state.go_to_crumb(index);
+                                    cx.notify();
+                                });
+                            })
+                    })
+                    .child(label),
             );
+        }
 
         // The trash shows a title where the drive shows a trail, at the same
         // weight and scale as the Photos destination it sits beside.
@@ -916,31 +1416,121 @@ impl TDriveView {
             .into_any_element()
     }
 
-    fn render_file_list(&self, loading: bool, cx: &mut Context<Self>) -> AnyElement {
-        let mut rows: Vec<AnyElement> = Vec::new();
-        if self.state.trash_mode() {
-            for index in self.state.visible_trash() {
-                rows.push(self.render_trash_row(index, cx));
-            }
-        } else if loading {
-            rows.extend((0..7).map(skeleton_row));
-        } else {
-            for index in self.state.visible_files() {
-                rows.push(self.render_file_row(index, cx));
-            }
+    /// The row indices the list should draw, remembered until the search box,
+    /// the sort, the folder or the contents change.
+    ///
+    /// Recomputed only when its inputs change, because it is read on every
+    /// frame and a folder can hold six figures of entries.
+    fn ordered_rows(&self) -> Rc<Vec<usize>> {
+        self.row_cache().0
+    }
+
+    /// The active drive's stored bytes, memoised with the rows.
+    fn drive_size(&self) -> i64 {
+        self.row_cache().1
+    }
+
+    /// The visible rows and the drive's stored bytes for the current search
+    /// box, sort, folder and view, computed once per `rows_version`.
+    fn row_cache(&self) -> (Rc<Vec<usize>>, i64) {
+        let version = self.state.rows_version;
+        let view = self.state.view;
+        let drive = self.state.active_drive;
+        let folder = self.state.current_folder().to_string();
+        let trash = self.state.trash_mode();
+
+        let cached = {
+            let cache = self.rows_cache.borrow();
+            cache.as_ref().and_then(|cache| {
+                let fresh = cache.version == version
+                    && cache.view == view
+                    && cache.drive == drive
+                    && cache.folder == folder
+                    && cache.trash == trash;
+                fresh.then(|| (Rc::clone(&cache.rows), cache.total_size))
+            })
+        };
+        if let Some(rows) = cached {
+            return rows;
         }
-        let empty = !loading && rows.is_empty();
+
+        let rows = Rc::new(if trash {
+            self.state.visible_trash()
+        } else {
+            self.state.visible_files()
+        });
+        let total_size = self.state.total_size();
+        *self.rows_cache.borrow_mut() = Some(RowsCache {
+            version,
+            view,
+            drive,
+            folder,
+            trash,
+            rows: Rc::clone(&rows),
+            total_size,
+        });
+        (rows, total_size)
+    }
+
+    /// The scrolling list of rows.
+    ///
+    /// Windowed by height the way the original's `row-window.ts` is: only the
+    /// rows the viewport can show are built, and everything off-screen is
+    /// spacer. A drive with tens of thousands of files then renders a couple of
+    /// dozen rows per frame instead of all of them, which is the difference
+    /// between a smooth scroll and a crawl.
+    fn render_file_list(&self, loading: bool, cx: &mut Context<Self>) -> AnyElement {
+        let trash_mode = self.state.trash_mode();
+
+        if loading {
+            return div()
+                .id("file-list")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px(px(10.))
+                .flex()
+                .flex_col()
+                .children((0..7).map(skeleton_row))
+                .into_any_element();
+        }
+
+        let rows = self.ordered_rows();
+        let count = rows.len();
+        let view = cx.entity();
+        let body = if count == 0 {
+            self.empty_state()
+        } else {
+            let indices = Rc::clone(&rows);
+            uniform_list("file-rows", count, move |range, _window, cx| {
+                // The closure runs while the frame is laid out, after this
+                // view's own render has returned, so reading it here is safe.
+                let app: &App = cx;
+                let this = view.read(app);
+                range
+                    .map(|slot| {
+                        let index = indices[slot];
+                        if trash_mode {
+                            this.render_trash_row(index, &view)
+                        } else {
+                            this.render_file_row(index, &view)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .flex_1()
+            .min_h_0()
+            .into_any_element()
+        };
 
         div()
             .id("file-list")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
             .px(px(10.))
             .flex()
             .flex_col()
-            .children(rows)
-            .children(empty.then(|| self.empty_state()))
+            .child(body)
             .into_any_element()
     }
 
@@ -1015,11 +1605,16 @@ impl TDriveView {
             .into_any_element()
     }
 
-    fn render_file_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let view = cx.entity();
+    fn render_file_row(&self, index: usize, view: &Entity<TDriveView>) -> AnyElement {
+        let view = view.clone();
         let file = self.state.files[index].clone();
         let selected = self.state.selected_file == Some(index);
         let confirming = self.state.pending_delete == Some(file.message_id);
+        // A folder opens rather than downloading, so it carries no row actions.
+        let is_folder = file.is_folder();
+        let folder_id = file.object_id.clone();
+        let folder_name = file.name.clone();
+        let locked = file.encrypted;
         // The name a row hands its actions so they can reveal themselves on
         // hover; unique per row, because group names are a global registry.
         let group = SharedString::from(format!("row-{index}"));
@@ -1034,10 +1629,10 @@ impl TDriveView {
         let cancel_view = view.clone();
 
         let date = short_date(file.date);
-        let size = if file.kind == FileKind::Folder {
+        let size = if is_folder {
             "—".to_string()
         } else {
-            human_size(file.size)
+            human_size(file.display_size())
         };
         let meta = match &file.local_state {
             LocalState::Remote => None,
@@ -1046,76 +1641,86 @@ impl TDriveView {
             LocalState::Failed(_) => Some(("Failed", theme::danger())),
         };
 
-        let actions = div()
-            .w(px(theme::COL_ACTIONS_W))
-            .flex_shrink_0()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_end()
-            .gap(px(4.))
-            .children(meta.map(|(text, color)| {
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(theme::TYPE_XS))
-                    .text_color(color)
-                    .child(text)
-            }))
-            .child(if confirming {
-                row_action(
-                    SharedString::from(format!("confirm-{index}")),
-                    group.clone(),
-                    false,
-                    IconName::Check,
-                    false,
-                    "Confirm delete",
-                    move |cx| spawn_delete(confirm_view.clone(), index, cx),
-                )
-            } else {
-                row_action(
-                    SharedString::from(format!("download-{index}")),
-                    group.clone(),
-                    hidden,
-                    IconName::Download,
-                    false,
-                    "Download",
-                    move |cx| spawn_download(download_view.clone(), index, cx),
-                )
-            })
-            .child(if confirming {
-                row_action(
-                    SharedString::from(format!("cancel-{index}")),
-                    group.clone(),
-                    false,
-                    IconName::X,
-                    false,
-                    "Cancel",
-                    move |cx| {
-                        cancel_view.update(cx, |this, cx| {
-                            this.state.pending_delete = None;
-                            cx.notify();
-                        });
-                    },
-                )
-            } else {
-                row_action(
-                    SharedString::from(format!("delete-{index}")),
-                    group.clone(),
-                    hidden,
-                    IconName::Trash,
-                    true,
-                    "Delete",
-                    move |cx| {
-                        let message_id = ask_delete_view.read(cx).state.files[index].message_id;
-                        ask_delete_view.update(cx, |this, cx| {
-                            this.state.pending_delete = Some(message_id);
-                            this.state.selected_file = Some(index);
-                            cx.notify();
-                        });
-                    },
-                )
-            });
+        let actions = if is_folder {
+            // A folder has nothing to download and nothing to delete from here,
+            // so it keeps the column's width but no buttons.
+            div()
+                .w(px(theme::COL_ACTIONS_W))
+                .flex_shrink_0()
+                .into_any_element()
+        } else {
+            div()
+                .w(px(theme::COL_ACTIONS_W))
+                .flex_shrink_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .gap(px(4.))
+                .children(meta.map(|(text, color)| {
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(theme::TYPE_XS))
+                        .text_color(color)
+                        .child(text)
+                }))
+                .child(if confirming {
+                    row_action(
+                        SharedString::from(format!("confirm-{index}")),
+                        group.clone(),
+                        false,
+                        IconName::Check,
+                        false,
+                        "Confirm delete",
+                        move |cx| spawn_delete(confirm_view.clone(), index, cx),
+                    )
+                } else {
+                    row_action(
+                        SharedString::from(format!("download-{index}")),
+                        group.clone(),
+                        hidden,
+                        IconName::Download,
+                        false,
+                        "Download",
+                        move |cx| spawn_download(download_view.clone(), index, cx),
+                    )
+                })
+                .child(if confirming {
+                    row_action(
+                        SharedString::from(format!("cancel-{index}")),
+                        group.clone(),
+                        false,
+                        IconName::X,
+                        false,
+                        "Cancel",
+                        move |cx| {
+                            cancel_view.update(cx, |this, cx| {
+                                this.state.pending_delete = None;
+                                cx.notify();
+                            });
+                        },
+                    )
+                } else {
+                    row_action(
+                        SharedString::from(format!("delete-{index}")),
+                        group.clone(),
+                        hidden,
+                        IconName::Trash,
+                        true,
+                        "Delete",
+                        move |cx| {
+                            let message_id = ask_delete_view.read(cx).state.files[index].message_id;
+                            ask_delete_view.update(cx, |this, cx| {
+                                this.state.pending_delete = Some(message_id);
+                                this.state.selected_file = Some(index);
+                                cx.notify();
+                            });
+                        },
+                    )
+                })
+                .into_any_element()
+        };
 
         div()
             .id(SharedString::from(format!("row-{index}")))
@@ -1137,12 +1742,36 @@ impl TDriveView {
             })
             .on_click({
                 let clicking = open_view.clone();
-                move |_, _window, cx| {
+                let folder_id = folder_id.clone();
+                let folder_name = folder_name.clone();
+                move |event, window, cx| {
+                    // A single click selects the row; a double click activates
+                    // it, which is the split the original's `activateRow`
+                    // describes. Activation is what asks for the drive's key,
+                    // because an encrypted file cannot be read before it.
+                    let activate = event.click_count() >= 2;
+                    if is_folder {
+                        if activate {
+                            clicking.update(cx, |this, cx| {
+                                this.state
+                                    .enter_folder(folder_id.clone(), folder_name.clone());
+                                cx.notify();
+                            });
+                        }
+                        return;
+                    }
                     clicking.update(cx, |this, cx| {
                         this.state.selected_file = Some(index);
                         this.state.pending_delete = None;
                         cx.notify();
                     });
+                    if activate {
+                        spawn_download(clicking.clone(), index, cx);
+                        // A row that is locked raises the unlock prompt instead
+                        // of downloading, so the caret goes straight into it and
+                        // the passphrase can be typed without a second click.
+                        focus_unlock_field(&clicking, window, cx);
+                    }
                 }
             })
             .child(
@@ -1163,7 +1792,16 @@ impl TDriveView {
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme::text())
                             .child(file.name.clone()),
-                    ),
+                    )
+                    // A lock says the contents are encrypted, so the row cannot
+                    // be read until the drive's key is in memory.
+                    .children(locked.then(|| {
+                        div().flex_shrink_0().pl(px(6.)).child(glyph(
+                            IconName::Lock,
+                            13.,
+                            theme::text_muted(),
+                        ))
+                    })),
             )
             .child(
                 div()
@@ -1191,8 +1829,8 @@ impl TDriveView {
     /// live item, so it is not clickable and its Restore / Delete permanently
     /// pair is on the row at all times, as the original's `actionsInline` rows
     /// are.
-    fn render_trash_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let view = cx.entity();
+    fn render_trash_row(&self, index: usize, view: &Entity<TDriveView>) -> AnyElement {
+        let view = view.clone();
         let entry = self.state.trash[index].clone();
         let file = &entry.file;
         let confirming = self.state.pending_purge == Some(index);
@@ -1362,7 +2000,7 @@ fn sort_button(
         })
         .on_click(move |_, _window, cx| {
             view.update(cx, |this, cx| {
-                this.state.sort.toggle(key);
+                this.state.toggle_sort(key);
                 cx.notify();
             });
         })
@@ -1491,13 +2129,13 @@ fn skeleton_row(index: usize) -> AnyElement {
         .into_any_element()
 }
 
-fn drive_rows(state: &AppState, kind: DialogKind) -> Vec<(usize, String)> {
+fn drive_rows(state: &AppState, personal: bool) -> Vec<(usize, String)> {
     state
-        .dialogs
+        .drives
         .iter()
         .enumerate()
-        .filter(|(_, d)| d.kind == kind)
-        .map(|(i, d)| (i, d.title.clone()))
+        .filter(|(_, drive)| drive.kind.is_personal() == personal)
+        .map(|(index, drive)| (index, drive.title.clone()))
         .collect()
 }
 
@@ -1523,11 +2161,15 @@ fn field(label: &'static str, input: impl IntoElement) -> AnyElement {
         .into_any_element()
 }
 
+#[derive(Clone, Copy)]
 enum LoginAction {
     Connect,
     SendCode,
     Verify,
     Unlock,
+    /// Submit the passphrase in the unlock prompt, which is a form of its own
+    /// rather than a step of the sign-in flow.
+    UnlockVault,
 }
 
 fn login_button(
@@ -1540,16 +2182,17 @@ fn login_button(
         .primary()
         .label(label)
         .on_click(move |_, _window, cx| {
-            run_login_action(view.clone(), &action, cx);
+            run_login_action(view.clone(), action, cx);
         })
 }
 
-fn run_login_action(view: Entity<TDriveView>, action: &LoginAction, cx: &mut App) {
+fn run_login_action(view: Entity<TDriveView>, action: LoginAction, cx: &mut App) {
     match action {
         LoginAction::Connect => connect_telegram(view, cx),
         LoginAction::SendCode => send_login_code(view, cx),
         LoginAction::Verify => verify_login_code(view, cx),
         LoginAction::Unlock => unlock_two_factor(view, cx),
+        LoginAction::UnlockVault => submit_vault_password(view, cx),
     }
 }
 
@@ -1584,6 +2227,7 @@ fn connect_telegram(view: Entity<TDriveView>, cx: &mut App) {
     cx.spawn(async move |cx| {
         let session = session_path.clone();
         let creds_for_task = creds.clone();
+        let creds_for_save = creds.clone();
         let result = cx
             .background_spawn(async move { tele::connect(&creds_for_task, session) })
             .await;
@@ -1607,11 +2251,9 @@ fn connect_telegram(view: Entity<TDriveView>, cx: &mut App) {
                 match (&client, error) {
                     (Some(client), _) => {
                         this.state.tele = Some(client.clone());
-                        this.state.login.step = if authorized {
-                            LoginStep::LoggedIn
-                        } else {
-                            LoginStep::NeedPhone
-                        };
+                        if !authorized {
+                            this.state.login.step = LoginStep::NeedPhone;
+                        }
                     }
                     (None, Some(message)) => this.state.login.error = Some(message),
                     _ => {}
@@ -1623,7 +2265,13 @@ fn connect_telegram(view: Entity<TDriveView>, cx: &mut App) {
         // Run the listing after the update above: it updates this same view.
         if authorized {
             if let Some(client) = client {
-                cx.update(|cx| spawn_load_dialogs_inner(view, client, cx));
+                let creds = creds_for_save.clone();
+                cx.update(|cx| {
+                    // Remember the application credentials the way the original
+                    // does, so the next run starts filled in.
+                    let _ = config::save_credentials(creds.api_id, &creds.api_hash);
+                    spawn_after_login(view, client, cx);
+                });
             }
         }
     })
@@ -1728,7 +2376,7 @@ fn verify_login_code(view: Entity<TDriveView>, cx: &mut App) {
             })
         });
         if let Some(client) = to_list {
-            cx.update(|cx| spawn_load_dialogs_inner(view, client, cx));
+            cx.update(|cx| spawn_after_login(view, client, cx));
         }
     })
     .detach();
@@ -1774,7 +2422,7 @@ fn unlock_two_factor(view: Entity<TDriveView>, cx: &mut App) {
             })
         });
         if let Some(client) = to_list {
-            cx.update(|cx| spawn_load_dialogs_inner(view, client, cx));
+            cx.update(|cx| spawn_after_login(view, client, cx));
         }
     })
     .detach();
@@ -1786,76 +2434,304 @@ fn open_drive_clicked(view: Entity<TDriveView>, index: usize, cx: &mut App) {
     spawn_open_drive_inner(view, index, cx);
 }
 
-/// Load the drive list, then open the first personal drive.
+/// Turn a drive remembered on disk into a drive the shell can open.
+fn drive_from_stored(stored: &StoredDrive) -> Drive {
+    Drive {
+        id: stored.id,
+        title: stored.title.clone(),
+        kind: DriveKind::from_str(&stored.kind),
+        peer_ref: tele::peer_ref(stored.id, stored.access_hash),
+    }
+}
+
+/// After sign-in: go straight to the saved drive, or ask which channel is the
+/// drive when this device has never been told.
+///
+/// This is the original's split between `PreparePersonalDrive` and
+/// `SelectionRequired`, and it is what keeps the sidebar from filling up with
+/// unrelated chats: nothing is listed until a drive is chosen.
 ///
 /// Like the other task helpers here this leases the view, so it must be called
 /// from outside a `view.update` closure. GPUI panics if an entity is read while
 /// it is being updated, which is why follow-up work is returned out of the
 /// closures below instead of being started inside them.
-fn spawn_load_dialogs_inner(view: Entity<TDriveView>, client: TeleClient, cx: &mut App) {
+fn spawn_after_login(view: Entity<TDriveView>, client: TeleClient, cx: &mut App) {
+    let saved = DriveConfig::load();
+    let drives: Vec<Drive> = saved
+        .as_ref()
+        .map(|config| config.drives.iter().map(drive_from_stored).collect())
+        .unwrap_or_default();
+    let personal = saved
+        .as_ref()
+        .and_then(|config| config.personal())
+        .and_then(|stored| drives.iter().position(|drive| drive.id == stored.id));
+
     view.update(cx, |this, cx| {
-        this.state.dialogs_loading = true;
-        this.state.error = None;
+        this.state.tele = Some(client.clone());
+        this.state.drives = drives;
+        this.state.drives_loading = false;
+        this.state.login.working = None;
+        this.state.candidates_loading = personal.is_none();
+        this.state.login.step = if personal.is_some() {
+            LoginStep::LoggedIn
+        } else {
+            LoginStep::ChooseDrive
+        };
+        cx.notify();
+    });
+
+    match personal {
+        Some(index) => spawn_open_drive_inner(view, index, cx),
+        None => spawn_discover_candidates(view, client, cx),
+    }
+}
+
+/// Offer the account's own broadcast channels as drives.
+///
+/// The transport only returns channels the account created, so a private chat
+/// such as a conversation with a relative can never reach this list.
+fn spawn_discover_candidates(view: Entity<TDriveView>, client: TeleClient, cx: &mut App) {
+    view.update(cx, |this, cx| {
+        this.state.candidates_loading = true;
+        this.state.candidates_error = None;
+        this.state.confirming_create = false;
         cx.notify();
     });
     cx.spawn(async move |cx| {
         let result = cx
             .background_spawn({
                 let client = client.clone();
-                async move { tele::list_dialogs(&client) }
+                async move { tele::list_owned_channels(&client) }
             })
             .await;
-        let to_open = cx.update(|cx| {
+        cx.update(|cx| {
             view.update(cx, |this, cx| {
-                this.state.dialogs_loading = false;
-                let first_personal = match result {
-                    Ok(dialogs) => {
-                        this.state.dialogs = dialogs;
-                        this.state.status = format!("{} drives", this.state.dialogs.len());
-                        this.state.dialogs.iter().position(|d| d.kind.is_personal())
+                this.state.candidates_loading = false;
+                match result {
+                    Ok(channels) => {
+                        let mut candidates: Vec<DriveCandidate> = channels
+                            .into_iter()
+                            .map(|channel| DriveCandidate {
+                                id: channel.id,
+                                title: channel.title,
+                                created: channel.created,
+                                has_activity: channel.has_activity,
+                                recommended: false,
+                                peer_ref: channel.peer_ref,
+                            })
+                            .collect();
+                        config::order_candidates(
+                            &mut candidates,
+                            |candidate| candidate.title.as_str(),
+                            |candidate| candidate.created,
+                            |candidate| candidate.has_activity,
+                        );
+                        // Only the candidate that leads the list can be
+                        // recommended, and only when it carries the title a
+                        // drive made by TDrive would have.
+                        if let Some(first) = candidates.first_mut() {
+                            first.recommended = config::is_default_title(&first.title);
+                        }
+                        // Nothing is picked for the user: the original leaves
+                        // the list unselected so Continue cannot adopt a
+                        // channel that was never chosen.
+                        this.state.selected_candidate = None;
+                        this.state.status = format!("{} channels found", candidates.len());
+                        this.state.candidates = candidates;
                     }
-                    Err(message) => {
-                        this.state.error = Some(message);
-                        None
-                    }
-                };
+                    Err(message) => this.state.candidates_error = Some(message),
+                }
                 cx.notify();
-                first_personal
-            })
+            });
         });
-        if let Some(index) = to_open {
-            cx.update(|cx| spawn_open_drive_inner(view, index, cx));
+    })
+    .detach();
+}
+
+fn select_candidate(view: Entity<TDriveView>, index: usize, cx: &mut App) {
+    view.update(cx, |this, cx| {
+        this.state.selected_candidate = Some(index);
+        cx.notify();
+    });
+}
+
+/// Ask before creating a channel, because that is a real change to the account
+/// rather than a local setting.
+fn request_create_drive(view: Entity<TDriveView>, cx: &mut App) {
+    view.update(cx, |this, cx| {
+        this.state.confirming_create = true;
+        this.state.candidates_error = None;
+        cx.notify();
+    });
+}
+
+fn cancel_create_drive(view: Entity<TDriveView>, cx: &mut App) {
+    view.update(cx, |this, cx| {
+        this.state.confirming_create = false;
+        cx.notify();
+    });
+}
+
+/// Save a channel as this device's personal drive, then open it.
+///
+/// The channel id and access hash are written to `config.json` in the original's
+/// own shape, so the choice survives a restart instead of being asked again.
+fn adopt_personal_drive(
+    view: Entity<TDriveView>,
+    channel_id: i64,
+    access_hash: i64,
+    title: String,
+    peer_ref: grammers_session::types::PeerRef,
+    cx: &mut App,
+) {
+    let mut config = DriveConfig::load().unwrap_or_default();
+    config.replace_personal(StoredDrive {
+        id: channel_id,
+        access_hash,
+        title: title.clone(),
+        kind: DriveKind::Personal.as_str().to_string(),
+    });
+    let saved = config.save();
+    let mut drives = vec![Drive {
+        id: channel_id,
+        title: title.clone(),
+        kind: DriveKind::Personal,
+        peer_ref,
+    }];
+    for stored in config.drives.iter().filter(|drive| !drive.is_personal()) {
+        drives.push(drive_from_stored(stored));
+    }
+
+    view.update(cx, |this, cx| {
+        this.state.drives = drives;
+        this.state.candidates.clear();
+        this.state.selected_candidate = None;
+        this.state.selecting_drive = false;
+        this.state.login.step = LoginStep::LoggedIn;
+        this.state.status = match &saved {
+            Ok(()) => format!("Using {title}"),
+            Err(message) => format!("Using {title} (not saved: {message})"),
+        };
+        cx.notify();
+    });
+    spawn_open_drive_inner(view, 0, cx);
+}
+
+/// Use the channel the picker has selected.
+fn continue_with_candidate(view: Entity<TDriveView>, cx: &mut App) {
+    let picked = {
+        let this = view.read(cx);
+        this.state
+            .selected_candidate
+            .and_then(|index| this.state.candidates.get(index))
+            .map(|candidate| (candidate.id, candidate.title.clone(), candidate.peer_ref))
+    };
+    let Some((id, title, peer_ref)) = picked else {
+        return;
+    };
+    let access_hash = peer_ref.auth.hash();
+    adopt_personal_drive(view, id, access_hash, title, peer_ref, cx);
+}
+
+/// Make a brand new channel the drive, for an account that has none yet.
+fn create_personal_drive(view: Entity<TDriveView>, cx: &mut App) {
+    let client = {
+        let this = view.read(cx);
+        this.state.tele.clone()
+    };
+    let Some(client) = client else {
+        view.update(cx, |this, cx| {
+            this.state.candidates_error = Some("Connect to Telegram first.".to_string());
+            cx.notify();
+        });
+        return;
+    };
+
+    view.update(cx, |this, cx| {
+        this.state.selecting_drive = true;
+        this.state.candidates_error = None;
+        cx.notify();
+    });
+
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_spawn(async move {
+                tele::create_personal_channel(&client, DEFAULT_CHANNEL_TITLE, DEFAULT_CHANNEL_ABOUT)
+            })
+            .await;
+        match result {
+            Ok(channel) => {
+                cx.update(|cx| {
+                    adopt_personal_drive(
+                        view,
+                        channel.id,
+                        channel.access_hash,
+                        channel.title.clone(),
+                        channel.peer_ref,
+                        cx,
+                    );
+                });
+            }
+            Err(message) => {
+                cx.update(|cx| {
+                    view.update(cx, |this, cx| {
+                        this.state.selecting_drive = false;
+                        this.state.confirming_create = false;
+                        this.state.candidates_error = Some(message);
+                        cx.notify();
+                    });
+                });
+            }
         }
     })
     .detach();
 }
 
-/// Load a drive's files. Telegram has no notion of cancelling a request, so a
-/// reply that arrives after the user has moved to another drive is dropped
-/// rather than allowed to overwrite the list they are now looking at.
+/// Load a drive's contents.
+///
+/// The list comes from the drive's own operation messages, so ordinary chatter
+/// in the channel never becomes a row, and each row knows the folder it belongs
+/// to. Telegram has no notion of cancelling a request, so a reply that arrives
+/// after the user has moved to another drive is dropped rather than allowed to
+/// overwrite the list they are now looking at.
 ///
 /// Must not be called from inside a `view.update` closure; interrupt the
 /// closure and let it return first.
 fn spawn_open_drive_inner(view: Entity<TDriveView>, index: usize, cx: &mut App) {
-    let (client, peer_ref, title, dialog_id) = {
+    let (client, peer_ref, title, drive_id) = {
         let this = view.read(cx);
-        let Some(client) = this.state.tele.clone() else {
+        let Some(drive) = this.state.drives.get(index) else {
             return;
         };
-        let Some(dialog) = this.state.dialogs.get(index) else {
-            return;
-        };
-        (client, dialog.peer_ref, dialog.title.clone(), dialog.id)
+        (
+            this.state.tele.clone(),
+            drive.peer_ref,
+            drive.title.clone(),
+            drive.id,
+        )
+    };
+
+    // Without a session there is nothing to read; in demo mode the seeded list
+    // already stands in for the drive, so switching still works.
+    let Some(client) = client else {
+        view.update(cx, |this, cx| {
+            this.state.open_drive(index);
+            this.state.set_view(ViewMode::Drive);
+            this.state.files_loading = false;
+            this.state.status = format!("{title} (demo data)");
+            cx.notify();
+        });
+        return;
     };
 
     view.update(cx, |this, cx| {
-        this.state.active_drive = Some(index);
-        this.state.view = ViewMode::Drive;
-        this.state.selected_file = None;
+        this.state.open_drive(index);
+        this.state.set_view(ViewMode::Drive);
         this.state.pending_delete = None;
         this.state.pending_purge = None;
         this.state.confirm_empty_trash = false;
-        this.state.files = Vec::new();
+        this.state.files.clear();
+        this.state.vault = None;
         this.state.files_loading = true;
         this.state.status = format!("Opening {title}...");
         this.state.error = None;
@@ -1866,20 +2742,38 @@ fn spawn_open_drive_inner(view: Entity<TDriveView>, index: usize, cx: &mut App) 
         let result = cx
             .background_spawn({
                 let client = client.clone();
-                async move { tele::list_files(&client, peer_ref) }
+                async move { tele::load_drive(&client, peer_ref) }
             })
             .await;
         cx.update(|cx| {
             view.update(cx, |this, cx| {
                 // Still the drive this request was started for?
-                if this.state.active_dialog().map(|d| d.id) != Some(dialog_id) {
+                if this.state.active_dialog().map(|d| d.id) != Some(drive_id) {
                     return;
                 }
                 this.state.files_loading = false;
                 match result {
-                    Ok(files) => {
-                        this.state.status = format!("{} files in {title}", files.len());
-                        this.state.files = files;
+                    Ok(contents) => {
+                        let count = contents.files.len();
+                        this.state.files = contents.files;
+                        // The drive's own trash is part of what was read, so
+                        // the Trash view shows what the *drive* deleted, not
+                        // only what this session did.
+                        this.state.trash = contents
+                            .trash
+                            .into_iter()
+                            .map(|entry| TrashEntry {
+                                deleted_at: DateTime::from_timestamp(entry.deleted_at, 0)
+                                    .unwrap_or_else(Utc::now),
+                                origin: title.clone(),
+                                file: entry.file,
+                            })
+                            .collect();
+                        // The key belongs to the drive, so a drive that has
+                        // one asks for it; one that does not never will.
+                        this.state.set_vault(contents.vault);
+                        this.state.touch();
+                        this.state.status = format!("{count} items in {title}");
                     }
                     Err(message) => {
                         this.state.status = "Could not open drive".to_string();
@@ -1893,23 +2787,69 @@ fn spawn_open_drive_inner(view: Entity<TDriveView>, index: usize, cx: &mut App) 
     .detach();
 }
 
+/// Put the caret in the passphrase field when the unlock prompt is up.
+///
+/// A locked row raises the prompt instead of downloading, and the row's click
+/// handler is the only place with the window in hand, so that is where the
+/// focus is moved from.
+fn focus_unlock_field(view: &Entity<TDriveView>, window: &mut Window, cx: &mut App) {
+    let prompting = view
+        .read(cx)
+        .state
+        .vault
+        .as_ref()
+        .is_some_and(|vault| vault.prompt.is_some());
+    if !prompting {
+        return;
+    }
+    let input = view.read(cx).vault_input.clone();
+    input.update(cx, |state, cx| state.focus(window, cx));
+}
+
+/// The messages a row's bytes live in, in order.
+///
+/// A plain upload is its own content; a file committed through the
+/// writable-mount path names a hidden body message or a multipart group.
+fn content_messages(file: &RemoteFile) -> Vec<i32> {
+    match &file.content {
+        ContentRef::OpMessage => vec![file.message_id],
+        ContentRef::Message(id) => vec![*id],
+        ContentRef::Parts(ids) => ids.clone(),
+    }
+}
+
 fn spawn_download(view: Entity<TDriveView>, index: usize, cx: &mut App) {
-    let (client, peer_ref, dialog_id, message_id, name) = {
+    let (client, peer_ref, drive_id, message_id, messages, name, encrypted, key) = {
         let this = view.read(cx);
-        let Some(dialog) = this.state.active_dialog().cloned() else {
+        let Some(drive) = this.state.active_dialog().cloned() else {
             return;
         };
         let Some(file) = this.state.files.get(index) else {
             return;
         };
+        let key = this.state.vault.as_ref().and_then(|vault| vault.key);
         (
             this.state.tele.clone(),
-            dialog.peer_ref,
-            dialog.id,
+            drive.peer_ref,
+            drive.id,
             file.message_id,
+            content_messages(file),
             sanitize_name(&file.name),
+            file.encrypted,
+            key,
         )
     };
+
+    // An encrypted file cannot be read without the drive's key, so ask for it
+    // first; a successful unlock resumes this download by itself.
+    if encrypted && key.is_none() {
+        view.update(cx, |this, cx| {
+            this.state.request_vault(Some(message_id));
+            this.state.status = format!("{name} is encrypted");
+            cx.notify();
+        });
+        return;
+    }
 
     // A download has to come from Telegram; without a session there is nothing
     // to fetch, so say so rather than leaving the row looking inert.
@@ -1932,16 +2872,19 @@ fn spawn_download(view: Entity<TDriveView>, index: usize, cx: &mut App) {
 
     cx.spawn(async move |cx| {
         let dest_for_task = dest.clone();
+        // Only an encrypted file takes the decrypting path, and only when the
+        // key is actually in memory.
+        let key_for_task = if encrypted { key } else { None };
         let result = cx
             .background_spawn(async move {
-                tele::download_file(&client, peer_ref, message_id, &dest_for_task)
+                tele::download_file(&client, peer_ref, &messages, &dest_for_task, key_for_task)
             })
             .await;
         cx.update(|cx| {
             view.update(cx, |this, cx| {
                 // A drive switch replaces the whole list, so the row this
                 // download belongs to is only still there if the drive is.
-                if this.state.active_dialog().map(|d| d.id) != Some(dialog_id) {
+                if this.state.active_dialog().map(|d| d.id) != Some(drive_id) {
                     return;
                 }
                 if let Some(file) = this.state.files.get_mut(index) {
@@ -1962,9 +2905,9 @@ fn spawn_download(view: Entity<TDriveView>, index: usize, cx: &mut App) {
 }
 
 fn spawn_upload(view: Entity<TDriveView>, cx: &mut App) {
-    let (client, peer_ref) = {
+    let (client, peer_ref, parent) = {
         let this = view.read(cx);
-        let (Some(client), Some(dialog)) = (this.state.tele.clone(), this.state.active_dialog())
+        let (Some(client), Some(drive)) = (this.state.tele.clone(), this.state.active_dialog())
         else {
             // An upload has nothing to write to without a session, so say so
             // rather than leaving the button looking inert.
@@ -1974,7 +2917,11 @@ fn spawn_upload(view: Entity<TDriveView>, cx: &mut App) {
             });
             return;
         };
-        (client, dialog.peer_ref)
+        (
+            client,
+            drive.peer_ref,
+            this.state.current_folder().to_string(),
+        )
     };
 
     view.update(cx, |this, cx| {
@@ -2003,8 +2950,17 @@ fn spawn_upload(view: Entity<TDriveView>, cx: &mut App) {
             });
         });
         let label = path.display().to_string();
+        // A file lands in the folder on screen and is named the way the
+        // filesystem names it, because that name goes into the drive's own
+        // metadata rather than being Telegram's business.
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "upload".to_string());
         let result = cx
-            .background_spawn(async move { tele::upload_file(&client, peer_ref, &path) })
+            .background_spawn(
+                async move { tele::upload_file(&client, peer_ref, &path, &parent, &name) },
+            )
             .await;
         let to_reload = cx.update(|cx| {
             view.update(cx, |this, cx| match result {
@@ -2022,6 +2978,99 @@ fn spawn_upload(view: Entity<TDriveView>, cx: &mut App) {
         });
         if let Some(index) = to_reload {
             cx.update(|cx| spawn_open_drive_inner(view, index, cx));
+        }
+    })
+    .detach();
+}
+
+/// Derive the drive's key from the passphrase the user typed.
+///
+/// The KDF is deliberately slow, so it runs off the UI thread; a wrong password
+/// is reported with the original's wording and the prompt stays open so the
+/// attempt can be corrected.
+fn submit_vault_password(view: Entity<TDriveView>, cx: &mut App) {
+    let password = view.read(cx).vault_input.read(cx).value().to_string();
+    let material = {
+        let this = view.read(cx);
+        let Some(vault) = this.state.vault.as_ref() else {
+            return;
+        };
+        if vault.working {
+            return;
+        }
+        vault.material.clone()
+    };
+    if password.is_empty() {
+        view.update(cx, |this, cx| {
+            if let Some(vault) = this.state.vault.as_mut() {
+                vault.error = Some("Enter your encryption password.".to_string());
+            }
+            cx.notify();
+        });
+        return;
+    }
+
+    view.update(cx, |this, cx| {
+        if let Some(vault) = this.state.vault.as_mut() {
+            vault.working = true;
+            vault.error = None;
+        }
+        cx.notify();
+    });
+
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_spawn(async move { crypto::unlock(&material, &password) })
+            .await;
+        let resume = cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                let Some(vault) = this.state.vault.as_mut() else {
+                    return None;
+                };
+                vault.working = false;
+                let resume = match result {
+                    Ok(key) => {
+                        vault.key = Some(key);
+                        vault.error = None;
+                        vault.prompt.take().and_then(|prompt| prompt.message_id)
+                    }
+                    Err(crypto::CryptoError::WrongPassword) => {
+                        vault.error = Some("That encryption password is incorrect.".to_string());
+                        None
+                    }
+                    Err(error) => {
+                        vault.error = Some(format!("Could not unlock: {error}"));
+                        None
+                    }
+                };
+                if this
+                    .state
+                    .vault
+                    .as_ref()
+                    .is_some_and(|vault| vault.unlocked())
+                {
+                    this.state.status = "Encrypted files unlocked".to_string();
+                }
+                cx.notify();
+                resume
+            })
+        });
+
+        // Unlocking resumes the download the prompt interrupted, if there was
+        // one. The row is found by message id so this stays correct even if the
+        // list moved underneath it.
+        if let Some(message_id) = resume {
+            cx.update(|cx| {
+                let index = view
+                    .read(cx)
+                    .state
+                    .files
+                    .iter()
+                    .position(|file| file.message_id == message_id);
+                if let Some(index) = index {
+                    spawn_download(view, index, cx);
+                }
+            });
         }
     })
     .detach();
@@ -2117,6 +3166,7 @@ fn restore_trash_entry(view: Entity<TDriveView>, index: usize, cx: &mut App) {
             let entry = this.state.trash.remove(index);
             this.state.status = format!("Restored {}", entry.file.name);
             this.state.files.push(entry.file);
+            this.state.touch();
         }
         this.state.pending_purge = None;
         cx.notify();
