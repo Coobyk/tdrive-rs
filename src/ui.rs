@@ -1958,8 +1958,8 @@ impl TDriveView {
         } else if self.state.photos_only() {
             (
                 IconName::Images,
-                "No photos here",
-                "This drive has no images.".to_string(),
+                "No photos or videos here",
+                "This drive has no images or videos.".to_string(),
             )
         } else if self.state.searching() {
             (
@@ -2063,6 +2063,7 @@ impl TDriveView {
             let file = self.state.files[index].clone();
             let drive_id = self.state.active_dialog().map(|d| d.id).unwrap_or(0);
             let message_id = file.message_id;
+            let is_image = file.kind == FileKind::Image;
             let encrypted = file.encrypted;
             let key = self.state.vault.as_ref().and_then(|v| v.key);
             let name = file.name.clone();
@@ -2088,10 +2089,13 @@ impl TDriveView {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .when(!exists && !downloading, |el| {
+                .when(is_image && !exists && !downloading, |el| {
                     el.child(glyph(IconName::Image, 32., theme::text_muted()))
                 })
-                .when(exists, |el| {
+                .when(!is_image, |el| {
+                    el.child(glyph(IconName::Video, 40., theme::text_muted()))
+                })
+                .when(is_image && exists, |el| {
                     el.child(
                         img(thumb.clone())
                             .w(px(152.))
@@ -2110,7 +2114,7 @@ impl TDriveView {
                         .child(name),
                 );
 
-            if !exists && !downloading {
+            if is_image && !exists && !downloading {
                 self.state.gallery_downloads.insert(message_id);
                 let (client, peer_ref) = (
                     self.state.tele.clone(),

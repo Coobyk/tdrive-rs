@@ -810,7 +810,12 @@ impl AppState {
         if self.searching() {
             return self.search_results();
         }
-        self.order(&self.files, Some(self.current_folder()), self.photos_only())
+        let folder = if self.photos_only() {
+            None
+        } else {
+            Some(self.current_folder())
+        };
+        self.order(&self.files, folder, self.photos_only())
     }
 
     /// Every entry in the drive whose name matches the search box, in the
@@ -960,13 +965,13 @@ impl AppState {
     /// and the whole pass is one allocation per row rather than one per
     /// comparison: a folder can hold a hundred thousand entries and this runs
     /// on every keystroke in the search box.
-    fn order(&self, files: &[RemoteFile], folder: Option<&str>, images_only: bool) -> Vec<usize> {
+    fn order(&self, files: &[RemoteFile], folder: Option<&str>, media_only: bool) -> Vec<usize> {
         let query = self.query.trim().to_lowercase();
         let mut keyed: Vec<(bool, String, usize)> = files
             .iter()
             .enumerate()
             .filter(|(_, f)| folder.is_none_or(|id| f.parent == id))
-            .filter(|(_, f)| !images_only || f.kind == FileKind::Image)
+            .filter(|(_, f)| !media_only || f.kind == FileKind::Image || f.kind == FileKind::Video)
             .filter(|(_, f)| query.is_empty() || f.name.to_lowercase().contains(&query))
             .map(|(i, f)| (!f.is_folder(), f.name.to_lowercase(), i))
             .collect();
