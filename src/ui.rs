@@ -14,8 +14,9 @@ use std::rc::Rc;
 use chrono::{DateTime, Utc};
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, IntoElement, ObjectFit, ParentElement, Render,
-    Rgba, SharedString, Styled, Subscription, Window, div, img, px, uniform_list,
+    AnyElement, App, Context, Entity, FontWeight, IntoElement, ListAlignment, ListState, ObjectFit,
+    ParentElement, Render, Rgba, SharedString, Styled, Subscription, Window, div, img, list, px,
+    uniform_list,
 };
 use gpui_component::{
     Disableable, Icon,
@@ -78,6 +79,16 @@ pub struct TDriveView {
     encrypt_confirm_input: Entity<InputState>,
     encrypt_hint_input: Entity<InputState>,
     rows_cache: RefCell<Option<RowsCache>>,
+    /// The variable-height list that virtualizes the gallery. It lives on the
+    /// view so measurements survive between frames, which is what lets headers
+    /// and tile rows share one scroll surface without the uniform-height
+    /// assumption `uniform_list` makes.
+    gallery_list: ListState,
+    /// The `rows_version` the gallery list was last rebuilt for.
+    gallery_list_version: u64,
+    /// The window width the last frame laid out with. The gallery sizes its
+    /// tiles from it, the way the original's `auto-fill` grid does.
+    viewport_w: f32,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -121,6 +132,9 @@ impl TDriveView {
             encrypt_confirm_input,
             encrypt_hint_input,
             rows_cache: RefCell::new(None),
+            gallery_list: ListState::new(0, ListAlignment::Top, px(400.)),
+            gallery_list_version: u64::MAX,
+            viewport_w: 1285.,
             _subscriptions: Vec::new(),
         };
 
@@ -455,7 +469,8 @@ fn row_action(
 // --- Render -----------------------------------------------------------------
 
 impl Render for TDriveView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.viewport_w = f32::from(window.bounds().size.width);
         let content = match self.state.login.step {
             LoginStep::LoggedIn => self.render_app(cx).into_any_element(),
             // Signed in but nothing saved on this device yet: the original asks
@@ -1498,6 +1513,9 @@ impl TDriveView {
         let view = cx.entity();
         let trash_mode = self.state.trash_mode();
         let gallery_mode = self.state.gallery_mode();
+        // In the gallery the file table and the folder trail step aside for the
+        // grid, exactly as the original's photos mode hides them.
+        let gallery_only = gallery_mode && !trash_mode;
         let (loading, can_upload, error) = {
             let state = &self.state;
             (
@@ -1645,13 +1663,22 @@ impl TDriveView {
         }
 
         // The trash shows a title where the drive shows a trail, at the same
-        // weight and scale as the Photos destination it sits beside.
+        // weight and scale as the Gallery destination it sits beside.
         let trash_heading = div()
             .flex_shrink_0()
             .text_size(px(theme::TYPE_LG))
             .font_weight(FontWeight::BOLD)
             .text_color(theme::text())
             .child("Trash");
+
+        // The gallery replaces the folder trail with its own title, because a
+        // drive-wide grid is not inside a folder at all.
+        let gallery_heading = div()
+            .flex_shrink_0()
+            .text_size(px(theme::TYPE_LG))
+            .font_weight(FontWeight::BOLD)
+            .text_color(theme::text())
+            .child("Gallery");
 
         let breadcrumb = div()
             .h(px(theme::BREADCRUMB_H))
@@ -1664,30 +1691,20 @@ impl TDriveView {
             .border_b_1()
             .border_color(theme::border_soft())
             .bg(theme::breadcrumb_bg())
-            // There is no folder to be at in the trash, so there is no trail to
-            // show and nowhere for Back to go: leaving is the sidebar's job.
-            .children((!trash_mode).then_some(back))
-            .children((!trash_mode).then_some(trail))
+            // There is no folder to be at in the trash or the gallery, so there
+            // is no trail to show and nowhere for Back to go: leaving is the
+            // sidebar's job.
+            .children((!trash_mode && !gallery_only).then_some(back))
+            .children((!trash_mode && !gallery_only).then_some(trail))
             .children(trash_mode.then_some(trash_heading))
+            .children(gallery_only.then_some(gallery_heading))
             .child(div().flex_1())
             // Destructive and irreversible, so it only appears when there is
             // something to empty and only arms on the first click.
             .children(
                 (trash_mode && trash_count > 0)
                     .then(|| empty_trash_button(view.clone(), empty_armed)),
-            )
-            .children((gallery_mode && !trash_mode).then(|| {
-                div()
-                    .flex_shrink_0()
-                    .px(px(10.))
-                    .py(px(2.))
-                    .rounded(px(999.))
-                    .bg(theme::overlay_accent_1())
-                    .text_size(px(theme::TYPE_XS))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::accent())
-                    .child("Gallery")
-            }));
+            );
         let sort = self.state.sort;
         let date_label = if trash_mode {
             "Time left"
@@ -1764,8 +1781,8 @@ impl TDriveView {
             .child(header)
             .child(breadcrumb)
             .children(banner)
-            .child(table_header)
-            .child(if gallery_mode && !trash_mode {
+            .children((!gallery_only).then_some(table_header))
+            .child(if gallery_only {
                 self.render_gallery(loading, cx)
             } else {
                 self.render_file_list(loading, cx)
@@ -2070,9 +2087,21 @@ impl TDriveView {
 
         let drive_id = self.state.active_dialog().map(|d| d.id).unwrap_or(0);
 
+        // The original's grid is `repeat(auto-fill, minmax(172px, 1fr))` with a
+        // 5px gap. Deriving the column count from the window width keeps the
+        // tiles square and every row full, whatever the window is doing.
+        const GAP: f32 = 5.;
+        const MIN_CELL: f32 = 172.;
+        const SIDEBAR_W: f32 = 240.;
+        const VIEW_PAD: f32 = 48.;
+        let content_w = (self.viewport_w - SIDEBAR_W - VIEW_PAD).max(MIN_CELL);
+        let cols = (((content_w + GAP) / (MIN_CELL + GAP)).floor() as usize).max(1);
+        let cell = ((content_w - GAP * (cols as f32 - 1.)) / cols as f32)
+            .floor()
+            .max(96.);
+
         // Virtualized: one row per (header or tile-row). Only visible rows
         // render, which is what keeps a large library scrollable.
-        const TILES_PER_ROW: usize = 6;
         enum GalleryRow {
             Header(String, usize),
             Tiles(Vec<usize>),
@@ -2088,132 +2117,174 @@ impl TDriveView {
                     .unwrap_or_else(|| parent.clone())
             };
             gallery_rows.push(GalleryRow::Header(header_name, group_indices.len()));
-            for chunk in group_indices.chunks(TILES_PER_ROW) {
+            for chunk in group_indices.chunks(cols) {
                 gallery_rows.push(GalleryRow::Tiles(chunk.to_vec()));
             }
         }
         let row_count = gallery_rows.len();
+        // Headers and tile rows differ in height, so the gallery needs the
+        // variable-height list rather than `uniform_list`. Its state only has
+        // to be rebuilt when the rows themselves change.
+        if self.gallery_list_version != self.state.rows_version {
+            self.gallery_list.reset(row_count);
+            self.gallery_list_version = self.state.rows_version;
+        }
+        let list_state = self.gallery_list.clone();
         let rows = std::rc::Rc::new(gallery_rows);
 
-        div()
-            .flex_1()
-            .min_h_0()
-            .child(uniform_list("gallery", row_count, move |range, _window, cx| {
+        list(list_state, move |ix, _window, cx| {
             let this = view.read(cx);
-            let rows = rows.clone();
-            range
-                .map(|slot| match &rows[slot] {
-                    GalleryRow::Header(name, count) => div()
-                        .w_full()
-                        .py(px(4.))
-                        .text_size(px(theme::TYPE_SM))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text_soft())
-                        .child(format!("{name}  ({count} items)"))
-                        .into_any_element(),
-                    GalleryRow::Tiles(indices) => {
-                        let mut row = div().flex().flex_row().gap(px(8.)).py(px(4.));
-                        for &index in indices {
-                            let file = this.state.files[index].clone();
-                            let message_id = file.message_id;
-                            let is_image = file.kind == FileKind::Image;
-                            let encrypted = file.encrypted;
-                            let key = this.state.vault.as_ref().and_then(|v| v.key);
-                            let name = file.name.clone();
-                            let thumb = thumb_path(drive_id, message_id);
-                            let exists = thumb.exists();
-                            let downloading = this.state.gallery_downloads.contains(&message_id);
+            match &rows[ix] {
+                GalleryRow::Header(name, count) => div()
+                    .w_full()
+                    .px(px(24.))
+                    .pt(px(16.))
+                    .pb(px(12.))
+                    .text_size(px(theme::TYPE_BASE))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme::text())
+                    .child(format!("{name}  ({count} items)"))
+                    .into_any_element(),
+                GalleryRow::Tiles(indices) => {
+                    let mut row = div().flex().flex_row().gap(px(GAP)).px(px(24.)).pb(px(GAP));
+                    for &index in indices {
+                        let file = this.state.files[index].clone();
+                        let message_id = file.message_id;
+                        let is_image = file.kind == FileKind::Image;
+                        let is_video = file.kind == FileKind::Video;
+                        let encrypted = file.encrypted;
+                        let key = this.state.vault.as_ref().and_then(|v| v.key);
+                        let thumb = thumb_path(drive_id, message_id);
+                        let exists = thumb.exists();
+                        let downloading = this.state.gallery_downloads.contains(&message_id);
 
-                            let tile_view = view.clone();
-                            let tile = div()
-                                .w(px(152.))
-                                .h(px(152.))
-                                .flex_shrink_0()
-                                .rounded(px(8.))
-                                .overflow_hidden()
-                                .bg(theme::surface_1())
-                                .border_1()
-                                .border_color(theme::border_soft())
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .justify_center()
-                                .when(is_image && !exists && !downloading, |el| {
-                                    el.child(glyph(IconName::Image, 32., theme::text_muted()))
-                                })
-                                .when(!is_image, |el| {
-                                    el.child(glyph(IconName::Video, 40., theme::text_muted()))
-                                })
-                                .when(is_image && exists, |el| {
-                                    el.child(
-                                        img(thumb.clone())
-                                            .w(px(152.))
-                                            .h(px(120.))
-                                            .object_fit(ObjectFit::Cover),
-                                    )
-                                })
-                                .child(
+                        let tile_view = view.clone();
+                        // A locked encrypted item cannot be decoded, so it
+                        // is never fetched: the bytes that would land on
+                        // disk are ciphertext, and caching them would stop
+                        // a later unlock from ever showing the picture.
+                        let locked = encrypted && key.is_none();
+                        let can_fetch = is_image && !locked;
+                        let shown = can_fetch && exists;
+                        let tile = div()
+                            .w(px(cell))
+                            .h(px(cell))
+                            .flex_shrink_0()
+                            .relative()
+                            .rounded(px(10.))
+                            .overflow_hidden()
+                            .bg(theme::surface_1())
+                            .border_1()
+                            .border_color(theme::border_soft())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(shown, |el| {
+                                el.child(
+                                    img(thumb.clone()).size_full().object_fit(ObjectFit::Cover),
+                                )
+                            })
+                            .when(!shown, |el| {
+                                el.child(glyph(
+                                    if locked {
+                                        IconName::Lock
+                                    } else if is_video {
+                                        IconName::Video
+                                    } else {
+                                        IconName::Image
+                                    },
+                                    (cell * 0.22).clamp(24., 44.),
+                                    theme::text_muted(),
+                                ))
+                            })
+                            // A video says so with a play badge, and an
+                            // encrypted item carries the same lock the file
+                            // list draws, both floating over the artwork.
+                            .when(is_video && !locked, |el| {
+                                el.child(
                                     div()
-                                        .w_full()
-                                        .px(px(6.))
-                                        .py(px(4.))
-                                        .text_size(px(theme::TYPE_XS))
-                                        .text_color(theme::text_muted())
-                                        .truncate()
-                                        .child(name),
-                                );
+                                        .absolute()
+                                        .right(px(8.))
+                                        .bottom(px(8.))
+                                        .w(px(28.))
+                                        .h(px(28.))
+                                        .rounded(px(999.))
+                                        .bg(theme::overlay_2())
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(glyph(IconName::Play, 14., theme::text())),
+                                )
+                            })
+                            .when(encrypted && !locked, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .right(px(8.))
+                                        .top(px(8.))
+                                        .w(px(22.))
+                                        .h(px(22.))
+                                        .rounded(px(6.))
+                                        .bg(theme::overlay_2())
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(glyph(IconName::Lock, 13., theme::text())),
+                                )
+                            });
 
-                            if is_image && !exists && !downloading {
-                                let thumb = thumb.clone();
-                                let tile_view = tile_view.clone();
-                                let encrypted = encrypted;
-                                let key = key;
-                                let message_id = message_id;
-                                let client = this.state.tele.clone();
-                                let peer_ref = this.state.active_dialog().map(|d| d.peer_ref);
-                                cx.spawn(async move |cx| {
-                                    tile_view.update(cx, |s, cx| {
-                                        s.state.gallery_downloads.insert(message_id);
+                        if can_fetch && !exists && !downloading {
+                            let thumb = thumb.clone();
+                            let tile_view = tile_view.clone();
+                            let encrypted = encrypted;
+                            let key = key;
+                            let message_id = message_id;
+                            let client = this.state.tele.clone();
+                            let peer_ref = this.state.active_dialog().map(|d| d.peer_ref);
+                            cx.spawn(async move |cx| {
+                                tile_view.update(cx, |s, cx| {
+                                    s.state.gallery_downloads.insert(message_id);
+                                    cx.notify();
+                                });
+                                let result = cx
+                                    .background_spawn(async move {
+                                        if let Some(parent) = thumb.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        let (Some(client), Some(peer_ref)) = (client, peer_ref)
+                                        else {
+                                            return;
+                                        };
+                                        let messages = vec![message_id];
+                                        let key_for_task = if encrypted { key } else { None };
+                                        let _ = tele::download_file(
+                                            &client,
+                                            peer_ref,
+                                            &messages,
+                                            &thumb,
+                                            key_for_task,
+                                        );
+                                    })
+                                    .await;
+                                let _ = result;
+                                cx.update(|cx| {
+                                    tile_view.update(cx, |this, cx| {
+                                        this.state.gallery_downloads.remove(&message_id);
                                         cx.notify();
                                     });
-                                    let result = cx
-                                        .background_spawn(async move {
-                                            if let Some(parent) = thumb.parent() {
-                                                let _ = std::fs::create_dir_all(parent);
-                                            }
-                                            let (Some(client), Some(peer_ref)) = (client, peer_ref)
-                                            else {
-                                                return;
-                                            };
-                                            let messages = vec![message_id];
-                                            let key_for_task = if encrypted { key } else { None };
-                                            let _ = tele::download_file(
-                                                &client,
-                                                peer_ref,
-                                                &messages,
-                                                &thumb,
-                                                key_for_task,
-                                            );
-                                        })
-                                        .await;
-                                    let _ = result;
-                                    cx.update(|cx| {
-                                        tile_view.update(cx, |this, cx| {
-                                            this.state.gallery_downloads.remove(&message_id);
-                                            cx.notify();
-                                        });
-                                    });
-                                })
-                                .detach();
-                            }
-
-                            row = row.child(tile);
+                                });
+                            })
+                            .detach();
                         }
-                        row.into_any_element()
+
+                        row = row.child(tile);
                     }
-                })
-                .collect::<Vec<_>>()
-        }))
+                    row.into_any_element()
+                }
+            }
+        })
+        .flex_1()
+        .min_h_0()
         .into_any_element()
     }
     fn render_file_row(&self, index: usize, view: &Entity<TDriveView>) -> AnyElement {
@@ -3594,6 +3665,7 @@ fn spawn_write_keeping_key(
                         apply_contents(&mut this.state, &title, Ok(contents));
                         if let Some((material, key)) = keep_key.as_ref() {
                             this.state.remember_vault_key(material, *key);
+                            clear_thumbnail_cache();
                         }
                         this.state.close_encryption_setup();
                         this.state.status = done;
@@ -3984,6 +4056,7 @@ fn submit_vault_password(view: Entity<TDriveView>, cx: &mut App) {
                     return None;
                 };
                 vault.working = false;
+                let unlocked = result.is_ok();
                 let resume = match result {
                     Ok(key) => {
                         vault.key = Some(key);
@@ -3999,6 +4072,10 @@ fn submit_vault_password(view: Entity<TDriveView>, cx: &mut App) {
                         None
                     }
                 };
+                if unlocked {
+                    // Ciphertext cached while locked is now stale.
+                    clear_thumbnail_cache();
+                }
                 if this
                     .state
                     .vault
@@ -4353,12 +4430,25 @@ fn empty_trash(view: Entity<TDriveView>, cx: &mut App) {
 }
 
 fn thumb_path(drive_id: i64, message_id: i32) -> PathBuf {
+    thumbnails_dir().join(format!("{drive_id}_{message_id}"))
+}
+
+/// Where the gallery keeps the pictures it has fetched.
+fn thumbnails_dir() -> PathBuf {
     directories::BaseDirs::new()
         .map(|dirs| dirs.cache_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))
         .join("tdrive")
         .join("thumbs")
-        .join(format!("{drive_id}_{message_id}"))
+}
+
+/// Throw away every cached thumbnail.
+///
+/// Called when the vault is unlocked. Anything fetched while it was locked was
+/// ciphertext, and leaving it on disk would keep the gallery showing a broken
+/// tile for a file the key has since made readable.
+fn clear_thumbnail_cache() {
+    let _ = std::fs::remove_dir_all(thumbnails_dir());
 }
 
 fn download_dir() -> PathBuf {
