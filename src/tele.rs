@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use grammers_client::media::Media;
+use grammers_client::media::{Media, PhotoSize};
 use grammers_client::{Client, SignInError};
 use grammers_mtsender::SenderPool;
 use grammers_session::Session as _;
@@ -1084,7 +1084,17 @@ pub async fn async_upload_file(
         ),
     };
 
-    let uploaded = client.upload_file(&body).await;
+    // The document carries the file's own name rather than the staging file's.
+    // Telegram's document name is what tells a reader the kind of file it is,
+    // so an encrypted picture uploaded under a random temp name would be filed
+    // as a plain document and never appear in the gallery.
+    let mut body_file = tokio::fs::File::open(&body)
+        .await
+        .map_err(|e| e.to_string())?;
+    let body_size = body_file.metadata().await.map_err(|e| e.to_string())?.len() as usize;
+    let uploaded = client
+        .upload_stream(&mut body_file, body_size, name.to_string())
+        .await;
     let uploaded = match uploaded {
         Ok(uploaded) => uploaded,
         Err(err) => {
@@ -1251,6 +1261,104 @@ async fn download_into(
     Ok(())
 }
 
+/// A gallery tile is a couple of hundred pixels wide, so a rendition past this
+/// is only extra bytes to move and decode.
+const THUMBNAIL_MAX_SIDE: i32 = 512;
+
+/// Pick the rendition worth drawing in a tile from the sizes Telegram keeps
+/// beside a photo or video.
+///
+/// The largest copy no bigger than a tile is the sweet spot: smaller ones look
+/// soft when stretched over a cell, and anything larger is bytes nobody sees.
+fn pick_thumbnail(thumbs: Vec<PhotoSize>) -> Option<PhotoSize> {
+    let mut candidates: Vec<(i32, PhotoSize)> = thumbs
+        .into_iter()
+        .filter_map(|thumb| {
+            let side = match &thumb {
+                PhotoSize::Size(size) => size.width.max(size.height),
+                PhotoSize::Cached(size) => size.width.max(size.height),
+                PhotoSize::Progressive(size) => size.width.max(size.height),
+                // `Empty` carries nothing, and `Stripped` is a handful of
+                // header bytes that are not an image on their own.
+                _ => return None,
+            };
+            Some((side, thumb))
+        })
+        .collect();
+    candidates.sort_by_key(|(side, _)| *side);
+    candidates
+        .iter()
+        .rev()
+        .find(|(side, _)| *side <= THUMBNAIL_MAX_SIDE)
+        .or_else(|| candidates.first())
+        .map(|(_, thumb)| thumb.clone())
+}
+
+/// The rendition Telegram keeps for a message's media, if it keeps one at all.
+async fn find_thumbnail(
+    client: &Client,
+    peer_ref: PeerRef,
+    message_id: i32,
+) -> Result<Option<PhotoSize>, String> {
+    let found = client
+        .get_messages_by_id(peer_ref, &[message_id])
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(media) = found
+        .into_iter()
+        .flatten()
+        .find_map(|message| message.media())
+    else {
+        return Ok(None);
+    };
+    let thumbs = match &media {
+        Media::Photo(photo) => photo.thumbs(),
+        Media::Document(document) => document.thumbs(),
+        _ => return Ok(None),
+    };
+    Ok(pick_thumbnail(thumbs))
+}
+
+/// Fetch a message's small rendition into `dest`.
+///
+/// `Ok(false)` means the message carries no thumbnail, so the caller can decide
+/// whether the whole body is worth pulling. A failed transfer leaves nothing
+/// behind, so a later frame retries rather than drawing a half-written file.
+async fn async_download_thumbnail(
+    client: &Client,
+    peer_ref: PeerRef,
+    message_id: i32,
+    dest: &Path,
+) -> Result<bool, String> {
+    use tokio::io::AsyncWriteExt;
+
+    let Some(thumb) = find_thumbnail(client, peer_ref, message_id).await? else {
+        return Ok(false);
+    };
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let mut writer = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut chunks = client.iter_download(&thumb);
+    while let Some(chunk) = chunks.next().await.map_err(|e| e.to_string())? {
+        if let Err(error) = writer.write_all(&chunk).await {
+            drop(writer);
+            let _ = tokio::fs::remove_file(dest).await;
+            return Err(error.to_string());
+        }
+    }
+    if let Err(error) = writer.flush().await {
+        drop(writer);
+        let _ = tokio::fs::remove_file(dest).await;
+        return Err(error.to_string());
+    }
+    Ok(true)
+}
+
 /// Download a row's contents, decrypting them on the way when the drive says
 /// they are encrypted.
 ///
@@ -1380,6 +1488,14 @@ pub fn download_file(
     key: Option<[u8; 32]>,
 ) -> Result<(), String> {
     RT.block_on(async_download_file(client, peer_ref, messages, dest, key))
+}
+pub fn download_thumbnail(
+    client: &Client,
+    peer_ref: PeerRef,
+    message_id: i32,
+    dest: &Path,
+) -> Result<bool, String> {
+    RT.block_on(async_download_thumbnail(client, peer_ref, message_id, dest))
 }
 
 #[cfg(test)]

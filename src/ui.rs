@@ -2164,7 +2164,11 @@ impl TDriveView {
                         // disk are ciphertext, and caching them would stop
                         // a later unlock from ever showing the picture.
                         let locked = encrypted && key.is_none();
-                        let can_fetch = is_image && !locked;
+                        // A video has no picture of its own, so the only
+                        // rendition worth having is Telegram's poster; an
+                        // encrypted one has no usable poster at all.
+                        let fetchable = if is_video { !encrypted } else { !locked };
+                        let can_fetch = (is_image || is_video) && fetchable;
                         let shown = can_fetch && exists;
                         let tile = div()
                             .w(px(cell))
@@ -2256,14 +2260,33 @@ impl TDriveView {
                                             return;
                                         };
                                         let messages = vec![message_id];
-                                        let key_for_task = if encrypted { key } else { None };
-                                        let _ = tele::download_file(
-                                            &client,
-                                            peer_ref,
-                                            &messages,
-                                            &thumb,
-                                            key_for_task,
-                                        );
+                                        // An encrypted body is ciphertext on
+                                        // the wire: Telegram has no picture of
+                                        // it, so the only way to a preview is to
+                                        // pull the whole thing and decrypt it.
+                                        if encrypted {
+                                            let _ = tele::download_file(
+                                                &client, peer_ref, &messages, &thumb, key,
+                                            );
+                                        } else {
+                                            // Everything else is painted from
+                                            // Telegram's own rendition, which is
+                                            // a fraction of the size.
+                                            let thumbnailed = matches!(
+                                                tele::download_thumbnail(
+                                                    &client, peer_ref, message_id, &thumb,
+                                                ),
+                                                Ok(true)
+                                            );
+                                            // A plain image with no rendition is
+                                            // still worth the whole body; a
+                                            // whole video is not.
+                                            if !thumbnailed && is_image {
+                                                let _ = tele::download_file(
+                                                    &client, peer_ref, &messages, &thumb, None,
+                                                );
+                                            }
+                                        }
                                     })
                                     .await;
                                 let _ = result;
