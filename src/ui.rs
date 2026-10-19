@@ -1680,6 +1680,44 @@ impl TDriveView {
             .text_color(theme::text())
             .child("Gallery");
 
+        // A drive whose media is encrypted opens the gallery as a wall of
+        // locks, and there is nothing in the grid itself to click to change
+        // that. Offer the unlock next to the title, where the pictures are.
+        let locked_gallery = gallery_only
+            && self
+                .state
+                .vault
+                .as_ref()
+                .is_some_and(|vault| vault.key.is_none())
+            && self.state.files.iter().any(|file| file.encrypted);
+        let unlock_view = view.clone();
+        let gallery_unlock = locked_gallery.then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .text_size(px(theme::TYPE_XS))
+                        .text_color(theme::text_muted())
+                        .child("Encrypted files are locked"),
+                )
+                .child(
+                    Button::new("gallery-unlock")
+                        .primary()
+                        .label("Unlock")
+                        .on_click(move |_, window, cx| {
+                            let view = unlock_view.clone();
+                            view.update(cx, |this, cx| {
+                                this.state.request_vault(None);
+                                cx.notify();
+                            });
+                            focus_unlock_field(&view, window, cx);
+                        }),
+                )
+        });
+
         let breadcrumb = div()
             .h(px(theme::BREADCRUMB_H))
             .flex_shrink_0()
@@ -1699,6 +1737,7 @@ impl TDriveView {
             .children(trash_mode.then_some(trash_heading))
             .children(gallery_only.then_some(gallery_heading))
             .child(div().flex_1())
+            .children(gallery_unlock)
             // Destructive and irreversible, so it only appears when there is
             // something to empty and only arms on the first click.
             .children(
