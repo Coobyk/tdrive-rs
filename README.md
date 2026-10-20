@@ -78,6 +78,7 @@ forgotten on a drive switch or logout.
 | `TDRIVE_THEME=tokyo-night` | Swaps the alternate dark palette in. Quiet Relay is the default, matching `DEFAULT_THEME_PREFERENCE.darkThemeId`. |
 | `TDRIVE_FULL_LOAD=1` | Ignores the snapshot and replays the drive's whole history. The same thing the header's Reload button does, and the way out if a snapshot is ever wrong. |
 | `TDRIVE_TRACE_OPS=1` | Prints one line about the replay to stderr — operations, objects, folders, encrypted, trashed, orphaned parents, unresolved bodies — plus a count per operation type. Numbers and object relationships only, never names or contents. A development aid for finding holes in the replay. |
+| `TDRIVE_UPLOAD=<path>` | Sends that file to the drive once it opens, so the upload path can be walked where there is no file dialog to pick a file with. A development aid. |
 
 ## What is implemented
 
@@ -227,6 +228,7 @@ cost.
 | `src/ui.rs` | The whole shell: login, drive picker, sidebar, header, breadcrumb, table, rows, trash, the vault prompt and the action handlers. |
 | `src/theme.rs` | Palette and metrics, mapped from the original's custom properties. |
 | `src/palettes.rs` | The original's seventeen palettes, one constant each, read out of its `theme-palettes.css`. |
+| `src/rendition.rs` | The small pictures published beside a file: made from its bytes, sealed for an encrypted drive, and read back only for the file they were made from. |
 | `src/models.rs` | Application state, the file and trash models, sorting, filtering and the session vault. |
 | `src/format.rs` | `formatBytes`, `formatDate` and the trash countdown wording, matching `frontend/src/utils.ts` and `ui/trash/trash-view.ts`. |
 | `src/ops.rs` | The `TDX1` operation wire format: parse and format, including the versioned writable-mount operations, with the same validation the original's `backend/projection/wire.go` applies. |
