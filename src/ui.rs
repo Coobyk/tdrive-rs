@@ -16,7 +16,7 @@ use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, IntoElement, ListAlignment, ListState, ObjectFit,
     ParentElement, Render, Rgba, SharedString, Styled, Subscription, Window, div, img, list, px,
-    uniform_list,
+    rgb, uniform_list,
 };
 use gpui_component::{
     Disableable, Icon,
@@ -26,7 +26,9 @@ use gpui_component::{
 use gpui_kit_assets::IconName;
 
 use crate::cache;
-use crate::config::{self, DEFAULT_CHANNEL_ABOUT, DEFAULT_CHANNEL_TITLE, DriveConfig, StoredDrive};
+use crate::config::{
+    self, DEFAULT_CHANNEL_ABOUT, DEFAULT_CHANNEL_TITLE, DriveConfig, StoredDrive, ThemePreference,
+};
 use crate::crypto::{self, VaultMaterial};
 use crate::format::{entry_origin, human_size, purge_countdown, short_date};
 use crate::models::{
@@ -72,6 +74,13 @@ pub struct TDriveView {
     code_input: Entity<InputState>,
     password_input: Entity<InputState>,
     search_input: Entity<InputState>,
+    /// The appearance the user last chose, kept with the drive list so it
+    /// survives a restart.
+    theme_pref: ThemePreference,
+    /// Whether the account menu is open.
+    menu_open: bool,
+    /// What the account menu is showing.
+    menu_view: MenuView,
     /// True when the passphrase field of the unlock prompt is waiting for the
     /// keyboard.
     ///
@@ -133,6 +142,22 @@ impl TDriveView {
         encrypt_password_input.update(cx, |state, cx| state.set_masked(true, window, cx));
         encrypt_confirm_input.update(cx, |state, cx| state.set_masked(true, window, cx));
 
+        // The theme the user last chose is the one on screen, before anything
+        // is drawn.
+        let theme_pref = DriveConfig::load().map(|config| config.theme).unwrap_or_default();
+        theme::set_theme(theme_pref.active());
+        // The controls the port borrows follow the mode too, so a light app
+        // does not open with a dark search box in it.
+        gpui_component::Theme::change(
+            if theme_pref.mode == "light" {
+                gpui_component::ThemeMode::Light
+            } else {
+                gpui_component::ThemeMode::Dark
+            },
+            None,
+            cx,
+        );
+
         let mut this = Self {
             state: AppState::default(),
             api_id_input,
@@ -143,6 +168,9 @@ impl TDriveView {
             search_input,
             vault_input,
             vault_focus_pending: false,
+            theme_pref,
+            menu_open: false,
+            menu_view: MenuView::Account,
             encrypt_password_input,
             encrypt_confirm_input,
             encrypt_hint_input,
@@ -241,7 +269,113 @@ impl TDriveView {
     }
 }
 
+/// What the account menu is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuView {
+    /// The account itself, and the things one can do to it.
+    Account,
+    /// The appearance panel, with the theme catalogue.
+    Appearance,
+}
+
 // --- Small building blocks --------------------------------------------------
+
+/// The account menu's trigger, at the end of the header.
+fn profile_trigger(view: Entity<TDriveView>) -> impl IntoElement {
+    div()
+        .id("profile-trigger")
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .h(px(32.))
+        .px(px(6.))
+        .rounded(px(16.))
+        .cursor_pointer()
+        .hover(|el| el.bg(theme::overlay_1()))
+        .child(
+            div()
+                .size(px(24.))
+                .rounded(px(12.))
+                .bg(theme::accent())
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(12.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme::on_accent())
+                .child("T"),
+        )
+        .child(glyph(IconName::ChevronDown, 14., theme::text_muted()))
+        .on_click(move |_, _window, cx| {
+            view.update(cx, |this, cx| {
+                this.menu_open = !this.menu_open;
+                this.menu_view = MenuView::Account;
+                cx.notify();
+            });
+        })
+}
+
+/// A theme's own picture of the shell, the way the original's palette card
+/// shows it: a sidebar, a top line and two rows.
+fn theme_preview(theme_def: &theme::Theme) -> impl IntoElement {
+    let [canvas, surface, accent, text] = theme_def.preview;
+    div()
+        .h(px(62.))
+        .w_full()
+        .flex()
+        .flex_row()
+        .gap(px(4.))
+        .p(px(4.))
+        .rounded(px(6.))
+        .bg(rgb(canvas))
+        .child(
+            // The sidebar.
+            div()
+                .w(px(32.))
+                .h_full()
+                .rounded(px(4.))
+                .bg(rgb(surface))
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .p(px(4.))
+                .child(div().h(px(4.)).w(px(10.)).rounded(px(2.)).bg(rgb(accent)))
+                .child(div().h(px(3.)).w_full().rounded(px(1.)).bg(rgb(text)))
+                .child(div().h(px(3.)).w(px(8.)).rounded(px(1.)).bg(rgb(text))),
+        )
+        .child(
+            // The content.
+            div()
+                .flex_1()
+                .h_full()
+                .rounded(px(4.))
+                .bg(rgb(surface))
+                .flex()
+                .flex_col()
+                .gap(px(5.))
+                .p(px(5.))
+                .child(div().h(px(4.)).w(px(24.)).rounded(px(2.)).bg(rgb(text)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.))
+                        .child(div().size(px(7.)).rounded(px(2.)).bg(rgb(accent)))
+                        .child(div().h(px(3.)).w(px(16.)).rounded(px(1.)).bg(rgb(text))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.))
+                        .child(div().size(px(7.)).rounded(px(2.)).bg(rgb(text)))
+                        .child(div().h(px(3.)).w(px(10.)).rounded(px(1.)).bg(rgb(text))),
+                ),
+        )
+}
 
 /// A bundled icon at an explicit size and colour.
 fn glyph(name: IconName, size: f32, color: Rgba) -> Icon {
@@ -1997,7 +2131,10 @@ impl TDriveView {
                         } else {
                             button
                         }
-                    })),
+                    }))
+                    // The account menu, at the end of the header's actions, as
+                    // it is in the original's shell.
+                    .child(profile_trigger(view.clone())),
             );
 
         // Back walks one folder up the trail; at the drive root there is
@@ -2238,6 +2375,7 @@ impl TDriveView {
             .h_full()
             .flex()
             .flex_col()
+            .relative()
             .bg(theme::canvas())
             .child(header)
             .child(breadcrumb)
@@ -2248,6 +2386,374 @@ impl TDriveView {
             } else {
                 self.render_file_list(loading, cx)
             })
+            .children(self.render_profile_menu(cx))
+            .into_any_element()
+    }
+
+    /// Put a theme on screen and remember it.
+    ///
+    /// The theme is remembered beside the drive list, in the same file the
+    /// original keeps its own settings, so the next launch opens in the theme
+    /// the user left it in.
+    fn set_theme(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !theme::set_theme(id) {
+            return;
+        }
+        if theme::theme_by_id(id).is_some_and(|entry| entry.appearance == theme::Appearance::Light)
+        {
+            self.theme_pref.mode = "light".to_string();
+            self.theme_pref.light = id.to_string();
+        } else {
+            self.theme_pref.mode = "dark".to_string();
+            self.theme_pref.dark = id.to_string();
+        }
+        self.save_theme_pref();
+        self.apply_component_theme(cx);
+        cx.notify();
+    }
+
+    /// Switch between the light and the dark mode, taking the theme each mode
+    /// was last left in.
+    fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
+        self.theme_pref.mode = mode.to_string();
+        let id = self.theme_pref.active().to_string();
+        theme::set_theme(&id);
+        self.save_theme_pref();
+        self.apply_component_theme(cx);
+        cx.notify();
+    }
+
+    /// Put the borrowed controls in the mode the app is in.
+    ///
+    /// The search box, the buttons and the menus come from the component
+    /// library, which has a mode of its own; a light app with dark controls in
+    /// it is not the original's look.
+    fn apply_component_theme(&self, cx: &mut Context<Self>) {
+        let mode = if self.theme_pref.mode == "light" {
+            gpui_component::ThemeMode::Light
+        } else {
+            gpui_component::ThemeMode::Dark
+        };
+        gpui_component::Theme::change(mode, None, cx);
+    }
+
+    /// Write the theme preference down beside the drive list.
+    fn save_theme_pref(&self) {
+        let mut config = DriveConfig::load().unwrap_or_default();
+        config.theme = self.theme_pref.clone();
+        let _ = config.save();
+    }
+
+    /// The account menu, drawn over the shell while it is open.
+    ///
+    /// The original's menu holds the account, the appearance, the update check
+    /// and the sign-out. This one holds the account and the appearance, which
+    /// are the two the port can answer.
+    fn render_profile_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.menu_open {
+            return None;
+        }
+        let view = cx.entity();
+        Some(
+            div()
+                .absolute()
+                .top(px(theme::HEADER_H - 6.))
+                .right(px(20.))
+                .w(px(390.))
+                .max_h(px(680.))
+                .rounded(px(12.))
+                .bg(theme::glass_bg())
+                .border_1()
+                .border_color(theme::glass_border())
+                .child(match self.menu_view {
+                    MenuView::Account => self.render_account_menu(view.clone()),
+                    MenuView::Appearance => self.render_appearance_panel(view.clone()),
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The account menu's own view: who is signed in, and the way to change
+    /// how the app looks.
+    fn render_account_menu(&self, view: Entity<TDriveView>) -> AnyElement {
+        let appearance_view = view.clone();
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.))
+                    .px(px(16.))
+                    .py(px(14.))
+                    .child(
+                        div()
+                            .size(px(36.))
+                            .rounded(px(18.))
+                            .bg(theme::accent())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme::on_accent())
+                            .child("T"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(theme::TYPE_BASE))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text())
+                                    .child("Telegram account"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(theme::TYPE_XS))
+                                    .text_color(theme::text_muted())
+                                    .child("Signed in"),
+                            ),
+                    ),
+            )
+            .child(div().h(px(1.)).bg(theme::border_soft()))
+            .child(
+                div()
+                    .id("profile-menu-appearance")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.))
+                    .px(px(16.))
+                    .py(px(12.))
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme::overlay_1()))
+                    .child(glyph(IconName::Palette, 18., theme::text_muted()))
+                    .child(
+                        div()
+                            .text_size(px(theme::TYPE_BASE))
+                            .text_color(theme::text())
+                            .child("Appearance"),
+                    )
+                    .on_click(move |_, _window, cx| {
+                        appearance_view.update(cx, |this, cx| {
+                            this.menu_view = MenuView::Appearance;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The appearance panel: the light and dark modes, and the catalogue of
+    /// palettes for the mode on screen.
+    fn render_appearance_panel(&self, view: Entity<TDriveView>) -> AnyElement {
+        let mode = if self.theme_pref.mode == "light" {
+            theme::Appearance::Light
+        } else {
+            theme::Appearance::Dark
+        };
+        let active = self.theme_pref.active().to_string();
+        let back_view = view.clone();
+
+        let mut modes = div().flex().flex_row().gap(px(7.)).px(px(8.));
+        for (id, label, icon) in [
+            ("light", "Light", IconName::Sun),
+            ("dark", "Dark", IconName::Moon),
+        ] {
+            let selected = self.theme_pref.mode == id;
+            let card_view = view.clone();
+            modes = modes.child(
+                div()
+                    .id(SharedString::from(format!("appearance-mode-{id}")))
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(6.))
+                    .h(px(68.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(if selected {
+                        theme::overlay_accent_3()
+                    } else {
+                        theme::border_soft()
+                    })
+                    .bg(if selected {
+                        theme::overlay_accent_1()
+                    } else {
+                        theme::overlay_white_1()
+                    })
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme::overlay_2()))
+                    .child(
+                        div()
+                            .size(px(26.))
+                            .rounded(px(6.))
+                            .bg(if selected {
+                                theme::overlay_accent_2()
+                            } else {
+                                theme::overlay_white_1()
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(glyph(icon, 15., theme::text_muted())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if selected {
+                                theme::accent()
+                            } else {
+                                theme::text_muted()
+                            })
+                            .child(label),
+                    )
+                    .on_click(move |_, _window, cx| {
+                        card_view.update(cx, |this, cx| {
+                            this.set_theme_mode(id, cx);
+                        });
+                    }),
+            );
+        }
+
+        let mut grid = div().flex().flex_row().flex_wrap().gap(px(8.)).px(px(8.));
+        for entry in theme::THEMES {
+            if entry.appearance != mode {
+                continue;
+            }
+            let selected = entry.id == active;
+            let card_view = view.clone();
+            let id = entry.id;
+            grid = grid.child(
+                div()
+                    .id(SharedString::from(format!("appearance-theme-{id}")))
+                    .w(px(178.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .p(px(7.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(if selected {
+                        theme::accent()
+                    } else {
+                        theme::border_soft()
+                    })
+                    .bg(if selected {
+                        theme::overlay_accent_1()
+                    } else {
+                        theme::overlay_white_1()
+                    })
+                    .cursor_pointer()
+                    .hover(|el| el.bg(theme::overlay_2()))
+                    .child(theme_preview(entry))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .px(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme::text())
+                                    .child(entry.name),
+                            )
+                            .child(
+                                div()
+                                    .size(px(14.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(selected, |el| {
+                                        el.child(glyph(IconName::Check, 13., theme::accent()))
+                                    }),
+                            ),
+                    )
+                    .on_click(move |_, _window, cx| {
+                        card_view.update(cx, |this, cx| {
+                            this.set_theme(id, cx);
+                        });
+                    }),
+            );
+        }
+
+        let name = theme::theme_by_id(&active)
+            .map(|entry| entry.name.to_string())
+            .unwrap_or_default();
+
+        div()
+            .id("appearance-scroll")
+            .flex()
+            .flex_col()
+            .max_h(px(680.))
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px(px(16.))
+                    .py(px(12.))
+                    .border_b_1()
+                    .border_color(theme::border_soft())
+                    .child(
+                        div()
+                            .text_size(px(17.))
+                            .font_weight(FontWeight::EXTRA_BOLD)
+                            .text_color(theme::text())
+                            .child("Appearance"),
+                    )
+                    .child(
+                        div()
+                            .id("appearance-back")
+                            .cursor_pointer()
+                            .text_size(px(theme::TYPE_SM))
+                            .text_color(theme::text_muted())
+                            .child("Back")
+                            .on_click(move |_, _window, cx| {
+                                back_view.update(cx, |this, cx| {
+                                    this.menu_view = MenuView::Account;
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .child(modes)
+            .child(
+                div()
+                    .px(px(16.))
+                    .pt(px(14.))
+                    .pb(px(8.))
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme::text_muted())
+                    .child(if mode == theme::Appearance::Light {
+                        "Light palettes"
+                    } else {
+                        "Dark palettes"
+                    }),
+            )
+            .child(grid)
+            .child(
+                div()
+                    .px(px(16.))
+                    .py(px(10.))
+                    .text_size(px(theme::TYPE_XS))
+                    .text_color(theme::text_muted())
+                    .child(format!("{name} is active.")),
+            )
             .into_any_element()
     }
 

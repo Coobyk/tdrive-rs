@@ -184,6 +184,55 @@ impl StoredDrive {
     }
 }
 
+/// The appearance the user last chose, the way the original keeps it.
+///
+/// The original stores this in its own settings; this port keeps it in the
+/// same file as the drive list, which the original reads and ignores the keys
+/// it does not know, so the two can share the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThemePreference {
+    /// `light` or `dark`.
+    #[serde(default = "default_theme_mode")]
+    pub mode: String,
+    /// The light theme in use.
+    #[serde(default = "default_light_theme")]
+    pub light: String,
+    /// The dark theme in use.
+    #[serde(default = "default_dark_theme")]
+    pub dark: String,
+}
+
+fn default_theme_mode() -> String {
+    "dark".to_string()
+}
+fn default_light_theme() -> String {
+    "daybreak".to_string()
+}
+fn default_dark_theme() -> String {
+    "quiet-relay".to_string()
+}
+
+impl Default for ThemePreference {
+    fn default() -> Self {
+        Self {
+            mode: default_theme_mode(),
+            light: default_light_theme(),
+            dark: default_dark_theme(),
+        }
+    }
+}
+
+impl ThemePreference {
+    /// The theme this preference puts on screen.
+    pub fn active(&self) -> &str {
+        if self.mode == "light" {
+            &self.light
+        } else {
+            &self.dark
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DriveConfig {
     /// The personal drive, spelled the way the original spells it.
@@ -197,6 +246,9 @@ pub struct DriveConfig {
     /// not know, so the two can share the file.
     #[serde(default)]
     pub drives: Vec<StoredDrive>,
+    /// The appearance the user last chose.
+    #[serde(default)]
+    pub theme: ThemePreference,
 }
 
 impl DriveConfig {

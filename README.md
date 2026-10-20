@@ -143,6 +143,12 @@ forgotten on a drive switch or logout.
 - **New folder, rename and move** — a folder is created with the drive's own
   `mkdir`, and a file or folder is renamed and moved with the classic `rename`
   and `move` operations, so the original reads them as it does its own.
+- **Appearance** — the account menu at the end of the header opens the
+  original's appearance panel: a light and a dark mode, and the catalogue of
+  seventeen palettes, each one the original's own colours read out of its
+  `theme-palettes.css`. A palette card draws the theme's own picture of the
+  shell, and the chosen theme is remembered beside the drive list, so the next
+  launch opens in it.
 - **Snapshot** — the drive's projection is kept beside the original's files, so
   a launch replays only the operations that arrived since the last one. On the
   test drive (6,571 messages, 5,724 objects) a full replay costs 64 s and a
@@ -160,7 +166,7 @@ Stated plainly, because the original does all of this and this port does not:
 - **WebDAV mount, photo backup, transfers, desktop updates** — none of them.
 - **New shared drive / Join with link** report that they are unconnected rather
   than opening their flows.
-- **Appearance settings, notifications** — none of them.
+- **Notifications** — none of them.
 
 ## Deliberate differences from the Svelte shell
 
@@ -220,6 +226,7 @@ cost.
 | `src/main.rs` | Window and application entry; the bundled icon set. |
 | `src/ui.rs` | The whole shell: login, drive picker, sidebar, header, breadcrumb, table, rows, trash, the vault prompt and the action handlers. |
 | `src/theme.rs` | Palette and metrics, mapped from the original's custom properties. |
+| `src/palettes.rs` | The original's seventeen palettes, one constant each, read out of its `theme-palettes.css`. |
 | `src/models.rs` | Application state, the file and trash models, sorting, filtering and the session vault. |
 | `src/format.rs` | `formatBytes`, `formatDate` and the trash countdown wording, matching `frontend/src/utils.ts` and `ui/trash/trash-view.ts`. |
 | `src/ops.rs` | The `TDX1` operation wire format: parse and format, including the versioned writable-mount operations, with the same validation the original's `backend/projection/wire.go` applies. |
