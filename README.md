@@ -121,6 +121,28 @@ forgotten on a drive switch or logout.
   search box searches the whole drive (folders first, each half in the column's
   own order, with the result's path where the date goes), and Photos narrows the
   active drive to images.
+- **Gallery** — the drive's pictures and videos, grouped into a section per
+  folder, in a windowed list that measures each row rather than assuming they
+  are all the same height. A plain file is shown from Telegram's own rendition,
+  which costs a few kilobytes. An encrypted file has no rendition of its own,
+  because the bytes on Telegram are ciphertext, so its tile carries a
+  "Load preview" button that says what the picture costs; only that one file is
+  fetched when it is pressed, the picture is made from it at 512 pixels, and the
+  file itself is thrown away, so the cache holds pictures rather than a second
+  copy of the drive. A file too large to be worth a picture is not fetched at
+  all. On the real drive (5,724 objects, 7.4 GB, every file encrypted) opening
+  and scrolling the gallery costs 66 bytes.
+- **Viewing a file** — a double click opens it: a picture is drawn, a text file
+  is shown as text, and anything else is saved. The file's name and kind head
+  the viewer, as they do in the original's.
+- **Multi-select** — a plain click picks one row, ctrl or cmd click toggles one,
+  shift click takes the range, and the selection is held by the drive's own
+  object id, so it survives the list being rebuilt. The selection bar sits over
+  the table header, with the count on the left and Download, Move, Delete and
+  Clear on the right.
+- **New folder, rename and move** — a folder is created with the drive's own
+  `mkdir`, and a file or folder is renamed and moved with the classic `rename`
+  and `move` operations, so the original reads them as it does its own.
 - **Snapshot** — the drive's projection is kept beside the original's files, so
   a launch replays only the operations that arrived since the last one. On the
   test drive (6,571 messages, 5,724 objects) a full replay costs 64 s and a
@@ -132,17 +154,13 @@ forgotten on a drive switch or logout.
 
 Stated plainly, because the original does all of this and this port does not:
 
-- **The rest of the write surface.** `mkdir` (a new folder) and the classic
-  `rename` / `move` namespace updates are formatted and parsed, but nothing in
-  the shell drives them yet, and the writable-mount operations (`fcommit`,
+- **The rest of the write surface.** The writable-mount operations (`fcommit`,
   `freplace`, `relocate`) are replayed but never written: uploads still send
   the single-message `t=f` form, encrypted or plain.
-- **Gallery, viewers, WebDAV mount, photo backup, transfers, desktop updates** —
-  none of it.
+- **WebDAV mount, photo backup, transfers, desktop updates** — none of them.
 - **New shared drive / Join with link** report that they are unconnected rather
   than opening their flows.
-- **Multi-select, batch actions, appearance settings, notifications** — none of
-  it.
+- **Appearance settings, notifications** — none of them.
 
 ## Deliberate differences from the Svelte shell
 
@@ -161,6 +179,11 @@ Each of these is a decision, not an omission:
   Date column's place.
 - **The row "more actions" ellipsis is not ported.** Its menu is a second surface
   for the two actions the row already offers, so the row stays two buttons wide.
+- **The gallery asks before it spends the reader's connection.** The original
+  runs its own rendition service, so its client only ever fetches a small
+  preview; this port has no server, so a picture of an encrypted file costs the
+  whole file and the gallery says so on the tile rather than pulling the drive
+  over the connection as the reader scrolls.
 
 Everything else — including the quiet-until-hovered row actions, the 2fr/1fr/1fr
 column ratio, the 44px rows, the 32px leading chips and the no-per-type-hue rule
