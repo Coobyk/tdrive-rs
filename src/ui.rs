@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
@@ -72,6 +72,13 @@ pub struct TDriveView {
     code_input: Entity<InputState>,
     password_input: Entity<InputState>,
     search_input: Entity<InputState>,
+    /// True when the passphrase field of the unlock prompt is waiting for the
+    /// keyboard.
+    ///
+    /// The focus is given while the frame is drawn rather than where the
+    /// prompt was opened, because the click that opened it is still finishing
+    /// and takes the focus back for itself.
+    vault_focus_pending: bool,
     /// The passphrase field in the "Unlock encrypted files" prompt.
     vault_input: Entity<InputState>,
     /// The three fields of the first-time encryption setup: password, its
@@ -135,6 +142,7 @@ impl TDriveView {
             password_input,
             search_input,
             vault_input,
+            vault_focus_pending: false,
             encrypt_password_input,
             encrypt_confirm_input,
             encrypt_hint_input,
@@ -482,6 +490,17 @@ fn row_action(
 impl Render for TDriveView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport_w = f32::from(window.bounds().size.width);
+        // A prompt that has just been opened takes the keyboard with it. The
+        // focus is given here, while the frame is being drawn, because the
+        // click that opened the prompt is still finishing and would take the
+        // focus back for itself.
+        if self.vault_focus_pending {
+            self.vault_focus_pending = false;
+            let input = self.vault_input.clone();
+            cx.defer_in(window, move |_this, window, cx| {
+                input.update(cx, |state, cx| state.focus(window, cx));
+            });
+        }
         let content = match self.state.login.step {
             LoginStep::LoggedIn => self.render_app(cx).into_any_element(),
             // Signed in but nothing saved on this device yet: the original asks
@@ -2090,16 +2109,29 @@ impl TDriveView {
                     Button::new("gallery-unlock")
                         .primary()
                         .label("Unlock")
-                        .on_click(move |_, window, cx| {
+                        .on_click(move |_, _window, cx| {
                             let view = unlock_view.clone();
                             view.update(cx, |this, cx| {
                                 this.state.request_vault_for(VaultResume::Nothing, None);
+                                this.vault_focus_pending = true;
                                 cx.notify();
                             });
-                            focus_unlock_field(&view, window, cx);
                         }),
                 )
         });
+
+        // The gallery says what an encrypted picture costs, because it costs
+        // the whole file: the bytes on Telegram are ciphertext and carry no
+        // rendition of their own, so a picture can only be made by fetching
+        // the file itself.
+        let gallery_note =
+            (gallery_only && !locked_gallery && self.state.files.iter().any(|file| file.encrypted))
+                .then(|| {
+                    div()
+                        .text_size(px(theme::TYPE_XS))
+                        .text_color(theme::text_muted())
+                        .child("Encrypted pictures cost their whole file to preview")
+                });
 
         let breadcrumb = div()
             .h(px(theme::BREADCRUMB_H))
@@ -2120,6 +2152,7 @@ impl TDriveView {
             .children(trash_mode.then_some(trash_heading))
             .children(gallery_only.then_some(gallery_heading))
             .child(div().flex_1())
+            .children(gallery_note)
             .children(gallery_unlock)
             // Destructive and irreversible, so it only appears when there is
             // something to empty and only arms on the first click.
@@ -2592,12 +2625,35 @@ impl TDriveView {
                         // disk are ciphertext, and caching them would stop
                         // a later unlock from ever showing the picture.
                         let locked = encrypted && key.is_none();
-                        // A video has no picture of its own, so the only
-                        // rendition worth having is Telegram's poster; an
-                        // encrypted one has no usable poster at all.
-                        let fetchable = if is_video { !encrypted } else { !locked };
-                        let can_fetch = (is_image || is_video) && fetchable;
-                        let shown = can_fetch && exists;
+                        // A plain file has a rendition of its own on
+                        // Telegram, which costs a few kilobytes, so it is
+                        // fetched as it scrolls past. An encrypted file has
+                        // none: its bytes are ciphertext, so a picture of
+                        // it costs the whole file. The gallery says what
+                        // that costs and waits to be asked, rather than
+                        // spending the reader's connection on every picture
+                        // that scrolls by.
+                        let cheap = !encrypted;
+                        // A plain file is fetched as it scrolls past, because
+                        // its rendition costs a few kilobytes. An encrypted
+                        // one is not: the bytes are ciphertext, so a picture
+                        // of it costs the whole file.
+                        let can_fetch = (is_image || is_video) && cheap;
+                        // A picture that has been made is shown whether it
+                        // was fetched for a few kilobytes or asked for.
+                        let shown = exists && !locked;
+                        // A picture of an encrypted file is worth asking
+                        // for, but not worth a file too large to be one.
+                        let askable = (is_image || is_video)
+                            && !cheap
+                            && !locked
+                            && !exists
+                            && file.size <= GALLERY_PREVIEW_LIMIT;
+                        let too_big = (is_image || is_video)
+                            && !cheap
+                            && !locked
+                            && !exists
+                            && file.size > GALLERY_PREVIEW_LIMIT;
                         let tile = div()
                             .w(px(cell))
                             .h(px(cell))
@@ -2616,7 +2672,10 @@ impl TDriveView {
                                     img(thumb.clone()).size_full().object_fit(ObjectFit::Cover),
                                 )
                             })
-                            .when(!shown, |el| {
+                            // The placeholder gives way to the button that
+                            // asks for the picture, so the two do not sit on
+                            // top of each other.
+                            .when(!shown && !askable && !too_big, |el| {
                                 el.child(glyph(
                                     if locked {
                                         IconName::Lock
@@ -2628,6 +2687,74 @@ impl TDriveView {
                                     (cell * 0.22).clamp(24., 44.),
                                     theme::text_muted(),
                                 ))
+                            })
+                            // An encrypted picture is fetched only when the
+                            // reader asks for it, and the button says what it
+                            // will cost.
+                            .when(askable, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .size_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            div()
+                                                .px(px(10.))
+                                                .py(px(6.))
+                                                .rounded(px(8.))
+                                                .bg(theme::surface_2())
+                                                .border_1()
+                                                .border_color(theme::border_soft())
+                                                .child(
+                                                    Button::new(format!("load-preview-{index}"))
+                                                        .ghost()
+                                                        .label(format!(
+                                                            "Load preview · {}",
+                                                            human_size(file.size)
+                                                        ))
+                                                        .on_click({
+                                                            let load_view = tile_view.clone();
+                                                            move |_, _window, cx| {
+                                                                // The button is
+                                                                // the picture's
+                                                                // own action, so
+                                                                // it does not
+                                                                // also open the
+                                                                // file.
+                                                                cx.stop_propagation();
+                                                                spawn_gallery_preview(
+                                                                    load_view.clone(),
+                                                                    index,
+                                                                    cx,
+                                                                );
+                                                            }
+                                                        }),
+                                                ),
+                                        ),
+                                )
+                            })
+                            .when(too_big, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .size_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            div()
+                                                .px(px(8.))
+                                                .text_size(px(theme::TYPE_XS))
+                                                .text_color(theme::text_muted())
+                                                .child("Too large to preview"),
+                                        ),
+                                )
                             })
                             // A video says so with a play badge, and an
                             // encrypted item carries the same lock the file
@@ -3005,7 +3132,15 @@ impl TDriveView {
                         // A row that is locked raises the unlock prompt instead
                         // of opening, so the caret goes straight into it and
                         // the passphrase can be typed without a second click.
-                        focus_unlock_field(&clicking, window, cx);
+                        if clicking
+                            .read(cx)
+                            .state
+                            .vault
+                            .as_ref()
+                            .is_some_and(|vault| vault.prompt.is_some())
+                        {
+                            clicking.update(cx, |this, _cx| this.vault_focus_pending = true);
+                        }
                     }
                 }
             })
@@ -4380,23 +4515,6 @@ fn spawn_write_keeping_key(
 
 /// Put the caret in the passphrase field when the unlock prompt is up.
 ///
-/// A locked row raises the prompt instead of downloading, and the row's click
-/// handler is the only place with the window in hand, so that is where the
-/// focus is moved from.
-fn focus_unlock_field(view: &Entity<TDriveView>, window: &mut Window, cx: &mut App) {
-    let prompting = view
-        .read(cx)
-        .state
-        .vault
-        .as_ref()
-        .is_some_and(|vault| vault.prompt.is_some());
-    if !prompting {
-        return;
-    }
-    let input = view.read(cx).vault_input.clone();
-    input.update(cx, |state, cx| state.focus(window, cx));
-}
-
 /// The messages a row's bytes live in, in order.
 ///
 /// A plain upload is its own content; a file committed through the
@@ -4437,6 +4555,7 @@ fn spawn_download(view: Entity<TDriveView>, index: usize, cx: &mut App) {
         view.update(cx, |this, cx| {
             this.state
                 .request_vault_for(VaultResume::Open, Some(message_id));
+            this.vault_focus_pending = true;
             this.state.status = format!("{name} is encrypted");
             cx.notify();
         });
@@ -4591,6 +4710,7 @@ fn advance_upload(view: Entity<TDriveView>, cx: &mut App) {
         view.update(cx, |this, cx| {
             if has_config {
                 this.state.request_vault_for(VaultResume::Upload, None);
+                this.vault_focus_pending = true;
                 this.state.status = "Enter your encryption password".to_string();
             } else {
                 this.state.open_encryption_setup();
@@ -5032,6 +5152,7 @@ fn commit_rename(view: Entity<TDriveView>, cx: &mut App) {
         view.update(cx, |this, cx| {
             this.state
                 .request_vault_for(VaultResume::Rename, Some(target.message_id));
+            this.vault_focus_pending = true;
             if let Some(pending) = this.state.pending_rename.as_mut() {
                 pending.working = true;
             }
@@ -5101,6 +5222,7 @@ fn commit_move(view: Entity<TDriveView>, cx: &mut App) {
         let message_id = items.first().map(|item| item.message_id);
         view.update(cx, |this, cx| {
             this.state.request_vault_for(VaultResume::Move, message_id);
+            this.vault_focus_pending = true;
             if let Some(pending) = this.state.pending_move.as_mut() {
                 pending.working = true;
             }
@@ -5365,6 +5487,7 @@ fn spawn_preview(view: Entity<TDriveView>, index: usize, cx: &mut App) {
         view.update(cx, |this, cx| {
             this.state
                 .request_vault_for(VaultResume::Preview, Some(file.message_id));
+            this.vault_focus_pending = true;
             this.state.status = format!("{} is encrypted", file.name);
             cx.notify();
         });
@@ -5454,6 +5577,127 @@ fn preview_path(file: &RemoteFile) -> PathBuf {
         .map(|dirs| dirs.cache_dir().join("preview"))
         .unwrap_or_else(|| PathBuf::from(".tdrive-preview"))
         .join(format!("{}-{}", file.message_id, sanitize_name(&file.name)))
+}
+
+/// The side of the picture the gallery keeps, in pixels.
+const GALLERY_PREVIEW_SIDE: u32 = 512;
+
+/// The largest file the gallery will fetch to make a picture of.
+///
+/// A picture of an encrypted file costs the whole file, because the bytes on
+/// Telegram are ciphertext and carry no rendition of their own. This is the
+/// line past which the gallery says the file is too large rather than
+/// spending the reader's connection on it.
+const GALLERY_PREVIEW_LIMIT: i64 = 32 * 1024 * 1024;
+
+/// Fetch a picture for the gallery, and keep only the small one.
+///
+/// The full file is thrown away once the picture is made, so the cache holds
+/// pictures rather than a second copy of the drive.
+fn spawn_gallery_preview(view: Entity<TDriveView>, index: usize, cx: &mut App) {
+    let (client, peer_ref, drive_id, file, key) = {
+        let this = view.read(cx);
+        let Some(drive) = this.state.active_dialog().cloned() else {
+            return;
+        };
+        let Some(file) = this.state.files.get(index).cloned() else {
+            return;
+        };
+        (
+            this.state.tele.clone(),
+            drive.peer_ref,
+            drive.id,
+            file,
+            this.state.vault.as_ref().and_then(|vault| vault.key),
+        )
+    };
+
+    if file.size > GALLERY_PREVIEW_LIMIT {
+        view.update(cx, |this, cx| {
+            this.state.status = format!("{} is too large to preview", file.name);
+            cx.notify();
+        });
+        return;
+    }
+
+    let Some(client) = client else {
+        view.update(cx, |this, cx| {
+            this.state.status = "Connect to Telegram to open the file".to_string();
+            cx.notify();
+        });
+        return;
+    };
+
+    let name = file.name.clone();
+    let message_id = file.message_id;
+    let thumb = thumb_path(drive_id, message_id);
+    // The body is fetched beside the picture and deleted once the picture is
+    // made, so a large file is never kept.
+    let staged = thumb.with_extension("tdrive-body");
+    let messages = content_messages(&file);
+    let key_for_task = if file.encrypted { key } else { None };
+    view.update(cx, |this, cx| {
+        this.state.gallery_downloads.insert(message_id);
+        this.state.status = format!("Fetching {name}...");
+        cx.notify();
+    });
+
+    cx.spawn(async move |cx| {
+        let staged_for_task = staged.clone();
+        let result = cx
+            .background_spawn(async move {
+                tele::download_file(&client, peer_ref, &messages, &staged_for_task, key_for_task)
+            })
+            .await;
+        // The picture is made from the file and the file is thrown away, so
+        // what the cache keeps is a picture and not a copy of the drive.
+        let made = match &result {
+            Ok(()) => write_thumbnail(&staged, &thumb),
+            Err(message) => Err(message.clone()),
+        };
+        let _ = std::fs::remove_file(&staged);
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                this.state.gallery_downloads.remove(&message_id);
+                if this.state.active_dialog().map(|d| d.id) != Some(drive_id) {
+                    return;
+                }
+                match made {
+                    Ok(()) => {
+                        this.state.status = format!("Loaded {name}");
+                    }
+                    Err(message) => {
+                        this.state.status = format!("Could not preview {name}");
+                        this.state.error = Some(message);
+                    }
+                }
+                cx.notify();
+            });
+        });
+    })
+    .detach();
+}
+
+/// Make a small picture from a file and write it out.
+///
+/// The picture is fitted into a square of the given size, so a big one costs
+/// little to keep.
+fn write_thumbnail(source: &Path, dest: &Path) -> Result<(), String> {
+    let reader = image::ImageReader::open(source)
+        .map_err(|e| e.to_string())?
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    let picture = reader.decode().map_err(|e| e.to_string())?;
+    let small = picture.thumbnail(GALLERY_PREVIEW_SIDE, GALLERY_PREVIEW_SIDE);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+    let mut writer = std::io::BufWriter::new(file);
+    small
+        .write_to(&mut writer, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// The viewer, drawn over the shell while a file is open.
@@ -5725,4 +5969,57 @@ fn truncate(text: &str, max: usize) -> String {
 #[allow(dead_code)]
 fn unused(file: &RemoteFile) -> String {
     file.name.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A picture of a file is kept small, so the cache holds pictures rather
+    /// than a second copy of the drive.
+    #[test]
+    fn a_thumbnail_is_fitted_into_a_square() {
+        let dir = std::env::temp_dir().join("tdrive-rs-thumbnail-test");
+        std::fs::create_dir_all(&dir).expect("a place to work in");
+        let source = dir.join("source.png");
+        let dest = dir.join("thumb");
+
+        let picture = image::RgbImage::from_fn(1000, 600, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        });
+        picture.save(&source).expect("the picture to be written");
+
+        write_thumbnail(&source, &dest).expect("the picture to be made");
+
+        // The cache keeps the picture without a name, so the format is read
+        // from the bytes rather than from the file's name.
+        let made = image::ImageReader::open(&dest)
+            .expect("the picture to be there")
+            .with_guessed_format()
+            .expect("the picture to have a format")
+            .decode()
+            .expect("the picture to be readable");
+        assert_eq!(made.width(), GALLERY_PREVIEW_SIDE);
+        assert!(made.height() <= GALLERY_PREVIEW_SIDE);
+        // The shape of the picture is kept, so a wide picture stays wide.
+        assert!(made.height() < made.width());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that is not a picture cannot be made into one, and the gallery
+    /// says so rather than keeping a broken file.
+    #[test]
+    fn a_file_that_is_not_a_picture_makes_no_thumbnail() {
+        let dir = std::env::temp_dir().join("tdrive-rs-thumbnail-test-bad");
+        std::fs::create_dir_all(&dir).expect("a place to work in");
+        let source = dir.join("source");
+        let dest = dir.join("thumb");
+        std::fs::write(&source, b"not a picture at all").expect("the file to be written");
+
+        assert!(write_thumbnail(&source, &dest).is_err());
+        assert!(!dest.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
