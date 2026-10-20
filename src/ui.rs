@@ -2663,6 +2663,16 @@ impl TDriveView {
                                         .justify_center()
                                         .child(glyph(IconName::Lock, 13., theme::text())),
                                 )
+                            })
+                            // A tile opens its file, the way the original's
+                            // gallery cell opens it in the viewer.
+                            .id(SharedString::from(format!("tile-{index}")))
+                            .cursor_pointer()
+                            .on_click({
+                                let tile_view = tile_view.clone();
+                                move |_, _window, cx| {
+                                    spawn_preview(tile_view.clone(), index, cx);
+                                }
                             });
 
                         if can_fetch && !exists && !downloading {
