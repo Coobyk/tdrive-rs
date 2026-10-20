@@ -32,11 +32,12 @@ use crate::config::{
 use crate::crypto::{self, VaultMaterial};
 use crate::format::{entry_origin, human_size, purge_countdown, short_date};
 use crate::models::{
-    AppState, ContentRef, Crumb, Drive, DriveCandidate, DriveKind, FileKind, LocalState, LoginStep,
-    PURGE_WINDOW_DAYS, Preview, PreviewKind, RemoteFile, SortKey, SortState, TrashEntry,
-    VaultResume, ViewMode, preview_kind,
+    AppState, ContentRef, Crumb, DerivativeJob, Drive, DriveCandidate, DriveKind, FileKind,
+    LocalState, LoginStep, PURGE_WINDOW_DAYS, Preview, PreviewKind, RemoteFile, SortKey, SortState,
+    TrashEntry, VaultResume, ViewMode, preview_kind,
 };
 use crate::ops::{self, Op};
+use crate::rendition;
 use crate::tele;
 use crate::tele::DriveContents;
 use crate::theme;
@@ -77,6 +78,8 @@ pub struct TDriveView {
     /// The appearance the user last chose, kept with the drive list so it
     /// survives a restart.
     theme_pref: ThemePreference,
+    /// True once the `TDRIVE_UPLOAD` development aid has sent its file.
+    upload_hook_done: bool,
     /// Whether the account menu is open.
     menu_open: bool,
     /// What the account menu is showing.
@@ -144,7 +147,9 @@ impl TDriveView {
 
         // The theme the user last chose is the one on screen, before anything
         // is drawn.
-        let theme_pref = DriveConfig::load().map(|config| config.theme).unwrap_or_default();
+        let theme_pref = DriveConfig::load()
+            .map(|config| config.theme)
+            .unwrap_or_default();
         theme::set_theme(theme_pref.active());
         // The controls the port borrows follow the mode too, so a light app
         // does not open with a dark search box in it.
@@ -169,6 +174,7 @@ impl TDriveView {
             vault_input,
             vault_focus_pending: false,
             theme_pref,
+            upload_hook_done: false,
             menu_open: false,
             menu_view: MenuView::Account,
             encrypt_password_input,
@@ -2270,6 +2276,69 @@ impl TDriveView {
                         .child("Encrypted pictures cost their whole file to preview")
                 });
 
+        // The pictures that have no derivative yet are the ones the gallery
+        // has to fetch whole. Making them is a job of its own, so it is
+        // offered here, with the count of what it would do.
+        let (without_derivative, derivative_bytes) = self
+            .state
+            .files
+            .iter()
+            .filter(|file| {
+                file.kind == FileKind::Image
+                    && !file.renditions.iter().any(|entry| entry.is_thumbnail())
+            })
+            .fold((0usize, 0i64), |(count, bytes), file| {
+                (count + 1, bytes + file.size)
+            });
+        let job_running = self
+            .state
+            .derivative_job
+            .as_ref()
+            .is_some_and(|job| job.running);
+        let derivative_button = (gallery_only && (without_derivative > 0 || job_running)).then(|| {
+            let view = view.clone();
+            let button: AnyElement = if job_running {
+                let view = view.clone();
+                div()
+                    .id("derivative-stop")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .on_click(move |_, _window, cx| {
+                        view.update(cx, |this, cx| {
+                            if let Some(job) = this.state.derivative_job.as_mut() {
+                                job.cancelled = true;
+                            }
+                            this.state.status = "Stopping after this picture".to_string();
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        div()
+                            .text_size(px(theme::TYPE_XS))
+                            .text_color(theme::text_muted())
+                            .child("Stop"),
+                    )
+                    .into_any_element()
+            } else {
+                Button::new("derivative-job")
+                    .ghost()
+                    .label(format!("Make previews ({without_derivative})"))
+                    .tooltip(format!(
+                        "Publish a small picture beside each picture, so the gallery does not have to fetch the whole file. This fetches the {} pictures once ({}) and publishes a small picture for each.",
+                        without_derivative,
+                        human_size(derivative_bytes)
+                    ))
+                    .on_click(move |_, _window, cx| {
+                        spawn_derivative_job(view.clone(), cx);
+                    })
+                    .into_any_element()
+            };
+            button
+        });
+
         let breadcrumb = div()
             .h(px(theme::BREADCRUMB_H))
             .flex_shrink_0()
@@ -2290,6 +2359,7 @@ impl TDriveView {
             .children(gallery_only.then_some(gallery_heading))
             .child(div().flex_1())
             .children(gallery_note)
+            .children(derivative_button)
             .children(gallery_unlock)
             // Destructive and irreversible, so it only appears when there is
             // something to empty and only arms on the first click.
@@ -3142,9 +3212,14 @@ impl TDriveView {
                         let cheap = !encrypted;
                         // A plain file is fetched as it scrolls past, because
                         // its rendition costs a few kilobytes. An encrypted
-                        // one is not: the bytes are ciphertext, so a picture
-                        // of it costs the whole file.
+                        // one has a derivative published beside it in the
+                        // drive, which costs a few kilobytes more; a file
+                        // without one is worth the whole body, and not
+                        // without asking.
+                        let derivative = file.renditions.iter().find(|entry| entry.is_thumbnail());
                         let can_fetch = (is_image || is_video) && cheap;
+                        let can_fetch_derivative =
+                            (is_image || is_video) && !cheap && !locked && derivative.is_some();
                         // A picture that has been made is shown whether it
                         // was fetched for a few kilobytes or asked for.
                         let shown = exists && !locked;
@@ -3154,11 +3229,13 @@ impl TDriveView {
                             && !cheap
                             && !locked
                             && !exists
+                            && derivative.is_none()
                             && file.size <= GALLERY_PREVIEW_LIMIT;
                         let too_big = (is_image || is_video)
                             && !cheap
                             && !locked
                             && !exists
+                            && derivative.is_none()
                             && file.size > GALLERY_PREVIEW_LIMIT;
                         let tile = div()
                             .w(px(cell))
@@ -3308,7 +3385,7 @@ impl TDriveView {
                                 }
                             });
 
-                        if can_fetch && !exists && !downloading {
+                        if (can_fetch || can_fetch_derivative) && !exists && !downloading {
                             let thumb = thumb.clone();
                             let tile_view = tile_view.clone();
                             let encrypted = encrypted;
@@ -3316,6 +3393,7 @@ impl TDriveView {
                             let message_id = message_id;
                             let client = this.state.tele.clone();
                             let peer_ref = this.state.active_dialog().map(|d| d.peer_ref);
+                            let derivative = derivative.cloned();
                             cx.spawn(async move |cx| {
                                 tile_view.update(cx, |s, cx| {
                                     s.state.gallery_downloads.insert(message_id);
@@ -3336,9 +3414,39 @@ impl TDriveView {
                                         // it, so the only way to a preview is to
                                         // pull the whole thing and decrypt it.
                                         if encrypted {
-                                            let _ = tele::download_file(
-                                                &client, peer_ref, &messages, &thumb, key,
-                                            );
+                                            // The drive holds a derivative
+                                            // published beside the file, and
+                                            // that is what the tile is drawn
+                                            // from: a few kilobytes rather
+                                            // than the whole picture.
+                                            let (Some(derivative), Some(key)) = (derivative, key)
+                                            else {
+                                                return;
+                                            };
+                                            let bytes = match tele::download_rendition(
+                                                &client,
+                                                peer_ref,
+                                                derivative.message_id,
+                                            ) {
+                                                Ok(bytes) => bytes,
+                                                Err(_) => return,
+                                            };
+                                            let picture = match rendition::decrypt(
+                                                &bytes,
+                                                &key,
+                                                &derivative.descriptor,
+                                            ) {
+                                                Ok(picture) => picture,
+                                                Err(_) => return,
+                                            };
+                                            // The picture is written beside
+                                            // its place and renamed into
+                                            // it, so a reader never sees
+                                            // half of one.
+                                            let staged = thumb.with_extension("tdrive-part");
+                                            if std::fs::write(&staged, picture).is_ok() {
+                                                let _ = std::fs::rename(&staged, &thumb);
+                                            }
                                         } else {
                                             // Everything else is painted from
                                             // Telegram's own rendition, which is
@@ -4842,6 +4950,8 @@ fn spawn_load_drive(view: Entity<TDriveView>, index: usize, refresh: bool, cx: &
         cache::load(drive_id).map(|snapshot| (snapshot.newest_message_id, snapshot.state))
     };
 
+    // The hook's own copy of the view, taken before the load's task takes it.
+    let hook_view = view.clone();
     cx.spawn(async move |cx| {
         let result = cx
             .background_spawn({
@@ -4869,6 +4979,10 @@ fn spawn_load_drive(view: Entity<TDriveView>, index: usize, refresh: bool, cx: &
                 apply_contents(&mut this.state, &title, result);
                 cx.notify();
             });
+            // A development aid: `TDRIVE_UPLOAD=<path>` sends that file to the
+            // drive once it has been read, so the upload path can be walked
+            // where there is no file dialog to pick a file with.
+            maybe_upload_hook(hook_view.clone(), cx);
         });
     })
     .detach();
@@ -5259,7 +5373,7 @@ fn submit_upload_options(view: Entity<TDriveView>, cx: &mut App) {
 /// `key` is the drive's master key when the batch is to be encrypted, and
 /// `None` when its bytes go to Telegram as they are.
 fn spawn_upload_file(view: Entity<TDriveView>, path: PathBuf, key: Option<[u8; 32]>, cx: &mut App) {
-    let (client, peer_ref, parent) = {
+    let (client, peer_ref, parent, drive_id) = {
         let this = view.read(cx);
         let (Some(client), Some(drive)) = (this.state.tele.clone(), this.state.active_dialog())
         else {
@@ -5273,6 +5387,7 @@ fn spawn_upload_file(view: Entity<TDriveView>, path: PathBuf, key: Option<[u8; 3
             client,
             drive.peer_ref,
             this.state.current_folder().to_string(),
+            drive.id,
         )
     };
 
@@ -5293,12 +5408,20 @@ fn spawn_upload_file(view: Entity<TDriveView>, path: PathBuf, key: Option<[u8; 3
         let upload_path = path.clone();
         let result = cx
             .background_spawn(async move {
-                tele::upload_file(&client, peer_ref, &upload_path, &parent, &name, key)
+                let message_id =
+                    tele::upload_file(&client, peer_ref, &upload_path, &parent, &name, key)?;
+                // The picture of a file that was just sent is made from the
+                // file that was just sent, so nothing is fetched to make it.
+                // It is published beside the file, so the gallery draws the
+                // picture from that little message instead of pulling the file
+                // again.
+                publish_derivative(&client, peer_ref, drive_id, message_id, &upload_path, key);
+                Ok(message_id)
             })
             .await;
         let to_reload = cx.update(|cx| {
             view.update(cx, |this, cx| match result {
-                Ok(()) => {
+                Ok(_) => {
                     this.state.status = format!("Uploaded {label}");
                     cx.notify();
                     this.state.active_drive
@@ -5319,6 +5442,279 @@ fn spawn_upload_file(view: Entity<TDriveView>, path: PathBuf, key: Option<[u8; 3
         }
     })
     .detach();
+}
+
+/// Send the file `TDRIVE_UPLOAD` names, once the drive is ready for it.
+///
+/// A development aid, so the upload path can be walked where there is no file
+/// dialog: the file goes out encrypted when the drive is, which is what the
+/// upload options would have chosen.
+fn maybe_upload_hook(view: Entity<TDriveView>, cx: &mut App) {
+    let Ok(path) = std::env::var("TDRIVE_UPLOAD") else {
+        return;
+    };
+    let ready = {
+        let this = view.read(cx);
+        if this.upload_hook_done {
+            return;
+        }
+        if this.state.active_dialog().is_none() || this.state.tele.is_none() {
+            return;
+        }
+        // An encrypted drive needs its key before a file can go out sealed.
+        let vault = this.state.vault.as_ref();
+        if vault.is_some() && vault.and_then(|vault| vault.key).is_none() {
+            return;
+        }
+        true
+    };
+    if !ready {
+        return;
+    }
+    view.update(cx, |this, _cx| this.upload_hook_done = true);
+    let key = view
+        .read(cx)
+        .state
+        .vault
+        .as_ref()
+        .and_then(|vault| vault.key);
+    spawn_upload_file(view, PathBuf::from(path), key, cx);
+}
+
+/// Make the drive's pictures into derivatives, one file at a time.
+///
+/// A derivative is a small picture published beside the file it was made
+/// from. A file that has one costs a few kilobytes to draw; a file without one
+/// costs the whole file, every time it is looked at. This job makes them, so
+/// the gallery is cheap afterwards.
+///
+/// Making one costs a fetch of the file, so the job says what it is about to
+/// do and the reader can stop it.
+fn spawn_derivative_job(view: Entity<TDriveView>, cx: &mut App) {
+    let (client, peer_ref, drive_id, key, todo) = {
+        let this = view.read(cx);
+        let (Some(client), Some(drive)) = (this.state.tele.clone(), this.state.active_dialog())
+        else {
+            return;
+        };
+        // An encrypted drive needs its key: a derivative of a sealed file is
+        // sealed too, and the file has to be read to be made.
+        let key = this.state.vault.as_ref().and_then(|vault| vault.key);
+        let encrypted = this.state.vault.is_some();
+        if encrypted && key.is_none() {
+            view.update(cx, |this, cx| {
+                this.state.request_vault_for(VaultResume::Nothing, None);
+                this.vault_focus_pending = true;
+                this.state.status = "Enter your encryption password".to_string();
+                cx.notify();
+            });
+            return;
+        }
+        // Every picture without a derivative, and nothing else.
+        let todo: Vec<RemoteFile> = this
+            .state
+            .files
+            .iter()
+            .filter(|file| {
+                file.kind == FileKind::Image
+                    && !file.renditions.iter().any(|entry| entry.is_thumbnail())
+            })
+            .cloned()
+            .collect();
+        (client, drive.peer_ref, drive.id, key, todo)
+    };
+
+    if todo.is_empty() {
+        view.update(cx, |this, cx| {
+            this.state.status = "Every picture already has a preview".to_string();
+            cx.notify();
+        });
+        return;
+    }
+
+    let total = todo.len();
+    view.update(cx, |this, cx| {
+        this.state.derivative_job = Some(DerivativeJob {
+            done: 0,
+            total,
+            current: String::new(),
+            cancelled: false,
+            running: true,
+        });
+        this.state.status = format!("Making previews for {total} pictures...");
+        cx.notify();
+    });
+
+    cx.spawn(async move |cx| {
+        for file in todo {
+            // The reader may stop the job between two files, which is the
+            // only place it can stop without leaving a half-made picture.
+            let cancelled = cx.update(|cx| {
+                view.read(cx)
+                    .state
+                    .derivative_job
+                    .as_ref()
+                    .is_some_and(|job| job.cancelled)
+            });
+            if cancelled {
+                break;
+            }
+
+            let name = file.name.clone();
+            cx.update(|cx| {
+                view.update(cx, |this, cx| {
+                    if let Some(job) = this.state.derivative_job.as_mut() {
+                        job.current = name.clone();
+                    }
+                    this.state.status = format!("Making a preview of {name}...");
+                    cx.notify();
+                });
+            });
+
+            // The file is fetched, made into a picture, and thrown away; only
+            // the picture is published.
+            let bytes = {
+                let client = client.clone();
+                let peer_ref = peer_ref.clone();
+                let file = file.clone();
+                let key = key;
+                cx.background_spawn(async move {
+                    let staged = std::env::temp_dir()
+                        .join(format!("tdrive-derivative-{}.bin", uuid::Uuid::new_v4()));
+                    let messages = content_messages(&file);
+                    let downloaded =
+                        tele::download_file(&client, peer_ref, &messages, &staged, key);
+                    let bytes = match downloaded {
+                        Ok(()) => std::fs::read(&staged).ok(),
+                        Err(_) => None,
+                    };
+                    let _ = std::fs::remove_file(&staged);
+                    bytes
+                })
+                .await
+            };
+
+            if let Some(bytes) = bytes {
+                if let Some(picture) = rendition::generate(&bytes, rendition::THUMBNAIL_EDGE) {
+                    let mut descriptor = ops::Rendition {
+                        channel_id: drive_id,
+                        file_msg_id: i64::from(file.message_id),
+                        content_msg_id: match file.content {
+                            ContentRef::OpMessage => i64::from(file.message_id),
+                            ContentRef::Message(id) => i64::from(id),
+                            ContentRef::Parts(_) => 0,
+                        },
+                        upload_uuid: String::new(),
+                        kind: ops::RENDITION_THUMBNAIL.to_string(),
+                        version: 1,
+                        size: 0,
+                        plaintext_size: picture.jpeg.len() as i64,
+                        width: picture.width as i32,
+                        height: picture.height as i32,
+                        encrypted: key.is_some(),
+                    };
+                    let payload = match key {
+                        Some(key) => match rendition::encrypt(&picture.jpeg, &key, &descriptor) {
+                            Ok(payload) => payload,
+                            Err(_) => Vec::new(),
+                        },
+                        None => picture.jpeg.clone(),
+                    };
+                    if !payload.is_empty() {
+                        descriptor.size = payload.len() as i64;
+                        let client = client.clone();
+                        let _ = cx
+                            .background_spawn(async move {
+                                tele::upload_rendition(&client, peer_ref, &descriptor, &payload)
+                            })
+                            .await;
+                    }
+                }
+            }
+
+            cx.update(|cx| {
+                view.update(cx, |this, cx| {
+                    if let Some(job) = this.state.derivative_job.as_mut() {
+                        job.done += 1;
+                    }
+                    cx.notify();
+                });
+            });
+        }
+
+        // The drive is read again, so the pictures that now have a derivative
+        // are drawn from it.
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                let done = this
+                    .state
+                    .derivative_job
+                    .as_ref()
+                    .map(|job| job.done)
+                    .unwrap_or_default();
+                this.state.derivative_job = None;
+                this.state.status = format!("Made {done} previews");
+                cx.notify();
+            });
+        });
+        let index = cx.update(|cx| view.read(cx).state.active_drive);
+        if let Some(index) = index {
+            cx.update(|cx| spawn_load_drive(view, index, true, cx));
+        }
+    })
+    .detach();
+}
+
+/// Publish the picture of a file beside the file it was made from.
+///
+/// The picture is a small derivative: a few tens of kilobytes, made from the
+/// file's own bytes. It is published as its own message, the way the original
+/// publishes one, so the gallery draws the picture from that little message
+/// instead of pulling the whole file again — and so the original app, which
+/// reads the same kind of message, draws it too.
+///
+/// A file that is not a picture has no picture to publish.
+fn publish_derivative(
+    client: &TeleClient,
+    peer_ref: grammers_session::types::PeerRef,
+    drive_id: i64,
+    file_message_id: i32,
+    path: &Path,
+    key: Option<[u8; 32]>,
+) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let Some(picture) = rendition::generate(&bytes, rendition::THUMBNAIL_EDGE) else {
+        return;
+    };
+    let encrypted = key.is_some();
+    let mut descriptor = ops::Rendition {
+        channel_id: drive_id,
+        file_msg_id: i64::from(file_message_id),
+        // The file's own message holds its bytes, so that is the message the
+        // derivative is bound to.
+        content_msg_id: i64::from(file_message_id),
+        upload_uuid: String::new(),
+        kind: ops::RENDITION_THUMBNAIL.to_string(),
+        version: 1,
+        size: 0,
+        plaintext_size: picture.jpeg.len() as i64,
+        width: picture.width as i32,
+        height: picture.height as i32,
+        encrypted,
+    };
+    let payload = match key {
+        Some(key) => match rendition::encrypt(&picture.jpeg, &key, &descriptor) {
+            Ok(payload) => payload,
+            Err(_) => return,
+        },
+        None => picture.jpeg.clone(),
+    };
+    descriptor.size = payload.len() as i64;
+    // A derivative that cannot be published is not worth failing the upload
+    // over: the file itself is already in the drive.
+    let _ = tele::upload_rendition(client, peer_ref, &descriptor, &payload);
 }
 
 /// Derive the drive's key from the passphrase the user typed.
@@ -5360,10 +5756,10 @@ fn submit_vault_password(view: Entity<TDriveView>, cx: &mut App) {
         let result = cx
             .background_spawn(async move { crypto::unlock(&material, &password) })
             .await;
-        let resume = cx.update(|cx| {
+        let (resume, unlocked) = cx.update(|cx| {
             view.update(cx, |this, cx| {
                 let Some(vault) = this.state.vault.as_mut() else {
-                    return None;
+                    return (None, false);
                 };
                 vault.working = false;
                 let unlocked = result.is_ok();
@@ -5395,9 +5791,15 @@ fn submit_vault_password(view: Entity<TDriveView>, cx: &mut App) {
                     this.state.status = "Encrypted files unlocked".to_string();
                 }
                 cx.notify();
-                resume
+                (resume, unlocked)
             })
         });
+
+        if unlocked {
+            // The drive can take a sealed file now.
+            let hook_view = view.clone();
+            cx.update(|cx| maybe_upload_hook(hook_view, cx));
+        }
 
         // Unlocking resumes whatever asked for the key: a download of a row, an
         // upload whose encryption was waiting on it, or a rename or a move the

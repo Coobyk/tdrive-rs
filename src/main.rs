@@ -6,6 +6,7 @@ mod format;
 mod models;
 mod ops;
 mod palettes;
+mod rendition;
 mod tele;
 mod theme;
 mod ui;

@@ -61,6 +61,25 @@ pub struct Drive {
     pub peer_ref: PeerRef,
 }
 
+/// The job that makes the drive's pictures into derivatives.
+///
+/// A derivative is a small picture published beside the file it was made
+/// from, so a gallery can draw it without pulling the file. Making one costs a
+/// fetch of the file, so the job is the reader's to start and to stop.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DerivativeJob {
+    /// How many files have been done.
+    pub done: usize,
+    /// How many files there are in all.
+    pub total: usize,
+    /// The file being worked on now.
+    pub current: String,
+    /// Whether the reader asked for the job to stop.
+    pub cancelled: bool,
+    /// Whether the job is running.
+    pub running: bool,
+}
+
 /// One entry in the "Choose your TDrive" picker: a broadcast channel the
 /// account created, which is the only shape a TDrive channel can have.
 #[derive(Clone)]
@@ -157,6 +176,26 @@ impl FileKind {
     }
 }
 
+/// A small derivative of a file's bytes, published beside it.
+///
+/// A derivative is a picture made from the file's own bytes and published as
+/// its own message. The gallery shows it instead of the file, so a picture
+/// costs a few kilobytes rather than the whole file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileRendition {
+    /// The message that holds the derivative's bytes.
+    pub message_id: i32,
+    /// The descriptor that binds the derivative to its file.
+    pub descriptor: crate::ops::Rendition,
+}
+
+impl FileRendition {
+    /// The derivative the gallery draws: the small one.
+    pub fn is_thumbnail(&self) -> bool {
+        self.descriptor.kind == crate::ops::RENDITION_THUMBNAIL
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RemoteFile {
     /// The message this row was read from: the op message for a `t=f` upload,
@@ -183,6 +222,12 @@ pub struct RemoteFile {
     /// The size before encryption, when the metadata carries it. A locked row
     /// shows this rather than the ciphertext size.
     pub plaintext_size: Option<i64>,
+    /// The small derivatives published beside this file, if any.
+    ///
+    /// A derivative is a picture made from the file's own bytes and published
+    /// as its own message: the gallery shows it instead of the file, so a
+    /// picture costs a few kilobytes instead of the whole file.
+    pub renditions: Vec<FileRendition>,
     /// Which message, or messages, hold the bytes; see [`ContentRef`].
     pub content: ContentRef,
     /// The writable revision of this object, or `0` for the unversioned ops.
@@ -625,6 +670,8 @@ pub struct AppState {
     /// Message ids whose thumbnail is currently being fetched for the gallery,
     /// so the tile is not asked to download the same image twice.
     pub gallery_downloads: std::collections::HashSet<i32>,
+    /// The job that makes the drive's pictures into derivatives, while it runs.
+    pub derivative_job: Option<DerivativeJob>,
     /// The drive's encryption config and session key, when it has one.
     pub vault: Option<Vault>,
     /// First-time encryption setup, while its modal is open.
@@ -701,6 +748,7 @@ impl Default for AppState {
             view: ViewMode::default(),
             rows_version: 0,
             gallery_downloads: std::collections::HashSet::new(),
+            derivative_job: None,
             vault: None,
             encryption_setup: None,
             upload_options: None,
@@ -1086,6 +1134,7 @@ impl AppState {
             parent: parent.to_string(),
             encrypted: false,
             plaintext_size: None,
+            renditions: Vec::new(),
             content: ContentRef::default(),
             revision: 1,
         });
@@ -1506,6 +1555,7 @@ impl AppState {
                 parent: parent.to_string(),
                 encrypted: false,
                 plaintext_size: None,
+                renditions: Vec::new(),
                 content: ContentRef::default(),
                 revision: 0,
             }
@@ -1760,6 +1810,7 @@ mod tests {
             parent: parent.to_string(),
             encrypted: false,
             plaintext_size: None,
+            renditions: Vec::new(),
             content: ContentRef::default(),
             revision: 0,
         }

@@ -37,11 +37,9 @@
 //!   rejected here as malformed.
 //! * `n`, `kdf` and `hint` must be valid UTF-8 after unescaping because the
 //!   ported API uses `String`; Go tolerates arbitrary bytes.
-//! * `rend` (image rendition) payloads are not modelled. The op-type guard is
-//!   mirrored (`rend` on anything but `part` is malformed), but the payload is
-//!   not decoded or validated.
-//! * [`Op::Part`] carries no size, so `sz` on a part message is validated and
-//!   then dropped; formatting a part never emits `sz`.
+//! * A part keeps its `sz`, the way Go does, and may carry a `rend`
+//!   descriptor: Go decodes and validates that payload, and so does this
+//!   port.
 //! * `encfg` has no explicit `enabled` key on the wire. Go's `applyEncConfig`
 //!   writes a config with `Enabled: true` for every `encfg` op, so a parsed
 //!   [`Op::EncConfig`] is always `enabled: true` rather than inventing a key.
@@ -67,6 +65,191 @@ pub const FILE_ID_PREFIX: &str = "f:";
 
 /// SQLite's upper bound for a unix timestamp: `9999-12-31T23:59:59Z`.
 const MAX_WIRE_UNIX_TIMESTAMP: i64 = 253_402_300_799;
+
+/// A small derivative of a file's bytes, published beside it.
+///
+/// The original calls this a rendition: a thumbnail or a preview of a
+/// picture, made from the file's own bytes and published as its own message.
+/// It is what lets a gallery show a picture without fetching the whole file,
+/// and it is bound to the file it was made from, so a replacement makes it
+/// ineligible without touching the old copy.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Rendition {
+    /// The drive the derivative belongs to.
+    pub channel_id: i64,
+    /// The message of the file this was made from.
+    pub file_msg_id: i64,
+    /// The message holding the file's bytes, or `0` for a multipart file.
+    pub content_msg_id: i64,
+    /// The multipart group the file's bytes live in, when it has one.
+    pub upload_uuid: String,
+    /// `thumbnail` for the grid, `preview` for the viewer.
+    pub kind: String,
+    /// The descriptor's own version.
+    pub version: i32,
+    /// The stored size of the derivative.
+    pub size: i64,
+    /// The size before encryption.
+    pub plaintext_size: i64,
+    /// The picture's width.
+    pub width: i32,
+    /// The picture's height.
+    pub height: i32,
+    /// Whether the derivative is encrypted, as the file it came from is.
+    pub encrypted: bool,
+}
+
+/// The kinds of derivative the original knows.
+pub const RENDITION_THUMBNAIL: &str = "thumbnail";
+pub const RENDITION_PREVIEW: &str = "preview";
+
+/// The largest derivative the original accepts.
+pub const MAX_RENDITION_BYTES: i64 = 4 << 20;
+
+impl Rendition {
+    /// The descriptor as the original writes it: the same JSON, field for
+    /// field, so the original reads a derivative this port publishes.
+    pub fn to_json(&self) -> String {
+        // The original's field order, with the same omissions: a multipart
+        // file has no content message, and an unencrypted derivative has no
+        // encryption to record.
+        let mut out = String::from("{\"c\":");
+        out.push_str(&self.channel_id.to_string());
+        out.push_str(",\"f\":");
+        out.push_str(&self.file_msg_id.to_string());
+        if self.content_msg_id != 0 {
+            out.push_str(",\"m\":");
+            out.push_str(&self.content_msg_id.to_string());
+        }
+        if !self.upload_uuid.is_empty() {
+            out.push_str(",\"u\":");
+            out.push_str(&json_string(&self.upload_uuid));
+        }
+        out.push_str(",\"k\":");
+        out.push_str(&json_string(&self.kind));
+        out.push_str(",\"v\":");
+        out.push_str(&self.version.to_string());
+        out.push_str(",\"s\":");
+        out.push_str(&self.size.to_string());
+        out.push_str(",\"p\":");
+        out.push_str(&self.plaintext_size.to_string());
+        out.push_str(",\"w\":");
+        out.push_str(&self.width.to_string());
+        out.push_str(",\"h\":");
+        out.push_str(&self.height.to_string());
+        if self.encrypted {
+            out.push_str(",\"e\":true");
+        }
+        out.push('}');
+        out
+    }
+
+    /// The descriptor as the original reads it.
+    pub fn from_json(raw: &str) -> Result<Self, OpError> {
+        let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| OpError::Malformed)?;
+        let number = |key: &str| -> Result<i64, OpError> {
+            value
+                .get(key)
+                .and_then(|v| v.as_i64())
+                .ok_or(OpError::Malformed)
+        };
+        let text = |key: &str| -> Result<String, OpError> {
+            value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string())
+                .ok_or(OpError::Malformed)
+        };
+        let rendition = Rendition {
+            channel_id: number("c")?,
+            file_msg_id: number("f")?,
+            content_msg_id: match value.get("m") {
+                Some(v) => v.as_i64().ok_or(OpError::Malformed)?,
+                None => 0,
+            },
+            upload_uuid: match value.get("u") {
+                Some(v) => v.as_str().unwrap_or_default().to_string(),
+                None => String::new(),
+            },
+            kind: text("k")?,
+            version: number("v")? as i32,
+            size: number("s")?,
+            plaintext_size: number("p")?,
+            width: number("w")? as i32,
+            height: number("h")? as i32,
+            encrypted: value.get("e").and_then(|v| v.as_bool()).unwrap_or(false),
+        };
+        rendition.validate()?;
+        Ok(rendition)
+    }
+
+    /// The checks the original makes on a descriptor.
+    ///
+    /// The bounds are the original's: a thumbnail is at most 512 pixels on a
+    /// side and a megabyte, a preview at most 1600 pixels and four.
+    pub fn validate(&self) -> Result<(), OpError> {
+        let (max_edge, max_bytes) = if self.kind == RENDITION_PREVIEW {
+            (1600, MAX_RENDITION_BYTES)
+        } else {
+            (512, 1 << 20)
+        };
+        if self.channel_id == 0
+            || self.file_msg_id <= 0
+            || self.version != 1
+            || (self.kind != RENDITION_THUMBNAIL && self.kind != RENDITION_PREVIEW)
+            || self.width <= 0
+            || self.height <= 0
+            || self.width > max_edge
+            || self.height > max_edge
+            || self.size <= 0
+            || self.size > max_bytes
+            || self.plaintext_size <= 0
+            || self.plaintext_size > max_bytes
+            || self.content_msg_id < 0
+            || (self.content_msg_id == 0) == self.upload_uuid.is_empty()
+            || self.upload_uuid.len() > 128
+        {
+            return Err(OpError::Malformed);
+        }
+        Ok(())
+    }
+
+    /// The descriptor as the wire carries it: the JSON, base64 in the
+    /// original's unpadded URL-safe alphabet.
+    pub fn encode(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.to_json())
+    }
+
+    /// The descriptor as the wire carries it, read back.
+    pub fn decode(raw: &str) -> Result<Self, OpError> {
+        if raw.len() > 2048 {
+            return Err(OpError::Malformed);
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(raw)
+            .map_err(|_| OpError::Malformed)?;
+        let text = String::from_utf8(bytes).map_err(|_| OpError::Malformed)?;
+        Self::from_json(&text)
+    }
+}
+
+/// A JSON string, quoted and escaped the way Go's encoder writes one.
+fn json_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
 
 /// One decoded drive operation.
 #[derive(Debug, Clone, PartialEq)]
@@ -171,6 +354,13 @@ pub enum Op {
         uuid: String,
         /// Zero-based position of this part.
         index: u32,
+        /// Stored size in bytes; `None` when the wire omitted `sz`.
+        ///
+        /// The original keeps this on a part too, and a derivative's size has
+        /// to match the descriptor that names it.
+        size: Option<i64>,
+        /// The derivative this part carries, when it carries one.
+        rendition: Option<Rendition>,
     },
     /// `t=fcommit`: commit a new logical file (writable-mount path).
     ///
@@ -536,8 +726,19 @@ pub fn parse(raw: &str) -> Result<Option<Op>, OpError> {
         "part" => {
             let uuid = parse_required_uuid(kv_get(&kv, "u").unwrap_or(""))?;
             let index = parse_u32(kv_get(&kv, "pix").unwrap_or(""))?;
-            parse_common_attrs(&kv, op_type)?;
-            Op::Part { uuid, index }
+            let attrs = parse_common_attrs(&kv, op_type)?;
+            // A derivative only ever rides on a part, and the original refuses
+            // the attribute anywhere else.
+            let rendition = match kv_get(&kv, "rend") {
+                Some(raw) => Some(Rendition::decode(raw)?),
+                None => None,
+            };
+            Op::Part {
+                uuid,
+                index,
+                size: attrs.size,
+                rendition,
+            }
         }
         "fcommit" => {
             let op_id = parse_writable_envelope(&kv)?;
@@ -826,13 +1027,25 @@ pub fn format(op: &Op) -> String {
                 *plaintext_size,
             );
         }
-        // Go also writes `sz` here when the part carries a size; this port does
-        // not retain it, so a formatted part never includes one.
-        Op::Part { uuid, index } => {
+        Op::Part {
+            uuid,
+            index,
+            size,
+            rendition,
+        } => {
             out.push_str("part|u=");
             out.push_str(uuid);
             out.push_str("|pix=");
             out.push_str(&index.to_string());
+            if let Some(size) = size {
+                out.push_str("|sz=");
+                out.push_str(&size.to_string());
+            }
+            // The derivative rides last, the way the original writes it.
+            if let Some(rendition) = rendition {
+                out.push_str("|rend=");
+                out.push_str(&rendition.encode());
+            }
         }
         Op::FileCommit {
             op_id,
@@ -1827,6 +2040,8 @@ mod tests {
             Op::Part {
                 uuid: "upload".to_string(),
                 index: 0,
+                size: Some(12),
+                rendition: None,
             }
         );
         assert!(matches!(
@@ -2095,6 +2310,8 @@ mod tests {
             format(&Op::Part {
                 uuid: "abc-123".to_string(),
                 index: 5,
+                size: None,
+                rendition: None,
             }),
             "TDX1|t=part|u=abc-123|pix=5"
         );
@@ -2114,12 +2331,15 @@ mod tests {
             "TDX1|t=manifest|u=abc-123|p=d:folder|n=My+File.mkv|pc=3|sz=5000|ts=1700|enc=1|psz=4096"
         );
         assert_eq!(op(&format(&manifest)), manifest);
-        // A part's `sz` is validated but not retained; `pc` must be positive.
+        // A part keeps its `sz`, the way the original does; `pc` must be
+        // positive.
         assert_eq!(
             op("TDX1|t=part|u=abc-123|pix=5|sz=2048"),
             Op::Part {
                 uuid: "abc-123".to_string(),
                 index: 5,
+                size: Some(2048),
+                rendition: None,
             }
         );
         malformed("TDX1|t=part|u=abc-123|pix=5|sz=-1");
@@ -2192,13 +2412,59 @@ mod tests {
     fn rendition_only_allowed_on_part() {
         malformed("TDX1|t=f|p=|n=x|rend=abc");
         malformed("TDX1|t=mkdir|obj=d:x|p=|n=x|rend=abc");
-        // The payload is not decoded, but the op-type guard still admits it.
+        // The payload is decoded now, and a broken one is malformed.
+        malformed("TDX1|t=part|u=u|pix=0|rend=not-base64");
+    }
+
+    /// A derivative rides on a part message, and the descriptor comes back
+    /// the way it went out.
+    #[test]
+    fn a_rendition_round_trips_through_the_wire() {
+        let rendition = Rendition {
+            channel_id: 42,
+            file_msg_id: 14,
+            content_msg_id: 14,
+            upload_uuid: String::new(),
+            kind: RENDITION_THUMBNAIL.to_string(),
+            version: 1,
+            size: 1234,
+            plaintext_size: 1200,
+            width: 512,
+            height: 384,
+            encrypted: true,
+        };
+        let part = Op::Part {
+            uuid: "group-1".to_string(),
+            index: 0,
+            size: Some(1234),
+            rendition: Some(rendition.clone()),
+        };
+        let header = format(&part);
+        assert!(header.contains("|rend="));
+        malformed("TDX1|t=part|u=group-1|pix=0|sz=1234|rend=not-base64");
+        assert_eq!(op(&header), part);
+    }
+
+    /// The descriptor the original writes is read back the same.
+    #[test]
+    fn a_rendition_descriptor_survives_the_json() {
+        let rendition = Rendition {
+            channel_id: 42,
+            file_msg_id: 14,
+            content_msg_id: 0,
+            upload_uuid: "group-1".to_string(),
+            kind: RENDITION_PREVIEW.to_string(),
+            version: 1,
+            size: 1234,
+            plaintext_size: 1200,
+            width: 1600,
+            height: 1200,
+            encrypted: false,
+        };
+        let json = rendition.to_json();
         assert_eq!(
-            op("TDX1|t=part|u=u|pix=0|rend=not-base64"),
-            Op::Part {
-                uuid: "u".to_string(),
-                index: 0,
-            }
+            Rendition::from_json(&json).expect("the descriptor"),
+            rendition
         );
     }
 
@@ -2303,6 +2569,8 @@ mod tests {
             Op::Part {
                 uuid: "abc-123".to_string(),
                 index: 5,
+                size: None,
+                rendition: None,
             },
             Op::EncConfig {
                 salt: b"salt".to_vec(),

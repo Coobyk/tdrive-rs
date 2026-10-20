@@ -26,7 +26,7 @@ use grammers_tl_types as tl;
 use tokio::runtime::Runtime;
 
 use crate::crypto::{self, VaultMaterial};
-use crate::models::{ContentRef, Credentials, FileKind, LocalState, RemoteFile};
+use crate::models::{ContentRef, Credentials, FileKind, FileRendition, LocalState, RemoteFile};
 use crate::ops::{self, Op};
 
 pub static RT: std::sync::LazyLock<Runtime> =
@@ -288,6 +288,15 @@ pub(crate) struct PartMessage {
     size: Option<i64>,
 }
 
+/// A derivative published beside a file, as the replay saw it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RenditionMessage {
+    /// The message holding the derivative's bytes.
+    message_id: i32,
+    /// The descriptor that binds it to its file.
+    rendition: ops::Rendition,
+}
+
 /// The objects one trash op took down: the object it named plus the descendants
 /// that were live at the time.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -386,6 +395,10 @@ fn row_from_op(
         encrypted,
         plaintext_size,
         content,
+        // A file's derivatives are attached once the whole history has been
+        // read, because a derivative can be published before the file it
+        // belongs to is seen.
+        renditions: Vec::new(),
         // Every object starts at revision 1: the drive's tables default to it,
         // and it is the revision a delete of an object never since changed
         // names against.
@@ -410,6 +423,8 @@ pub(crate) struct ReplayState {
     pub multipart: BTreeMap<String, String>,
     /// The drive's encryption config, newest wins.
     pub vault: Option<(VaultMaterial, String)>,
+    /// The derivatives published beside the files, by the file's message id.
+    pub renditions: BTreeMap<i64, Vec<RenditionMessage>>,
     /// The media of every message the replay has seen, by message id: a
     /// committed file's kind and size come from the message that holds its
     /// bytes, which may sit outside the range a resumed read covers.
@@ -434,6 +449,8 @@ struct Replay {
     multipart: BTreeMap<String, String>,
     /// The drive's encryption config, newest wins.
     vault: Option<(VaultMaterial, String)>,
+    /// The derivatives published beside the files, by the file's message id.
+    renditions: BTreeMap<i64, Vec<RenditionMessage>>,
     /// Whether to count operations by type for the `TDRIVE_TRACE_OPS` summary.
     trace: bool,
     /// Operations applied, by wire type. Only filled while `trace` is set.
@@ -453,6 +470,7 @@ impl Replay {
             parts: state.parts,
             multipart: state.multipart,
             vault: state.vault,
+            renditions: state.renditions,
             trace,
             counts: BTreeMap::new(),
         }
@@ -753,13 +771,29 @@ impl Replay {
                 }
                 self.trashed.retain(|_, group| !group.members.is_empty());
             }
-            Op::Part { uuid, index } => {
+            Op::Part {
+                uuid,
+                index,
+                rendition,
+                ..
+            } => {
                 self.parts.entry(uuid).or_default().push(PartMessage {
                     index,
                     message_id: id,
                     kind: entry.kind,
                     size: entry.size,
                 });
+                // A derivative is published as its own part message, bound to
+                // the file it was made from.
+                if let Some(rendition) = rendition {
+                    self.renditions
+                        .entry(rendition.file_msg_id)
+                        .or_default()
+                        .push(RenditionMessage {
+                            message_id: id,
+                            rendition,
+                        });
+                }
             }
             Op::EncConfig {
                 salt,
@@ -824,6 +858,35 @@ impl Replay {
             }
         }
 
+        // Attach each derivative to the file it was made from. A derivative
+        // that names a file the drive does not have is dropped: the file was
+        // deleted, and a picture of a file that is gone is nobody's business.
+        for (file_msg_id, found) in std::mem::take(&mut self.renditions) {
+            let mut list = Vec::with_capacity(found.len());
+            for entry in found {
+                list.push(FileRendition {
+                    message_id: entry.message_id,
+                    descriptor: entry.rendition,
+                });
+            }
+            let attach = |file: &mut RemoteFile| {
+                file.renditions.extend(list.iter().cloned());
+            };
+            let object_id = format!("f:{file_msg_id}");
+            if let Some(file) = self.objects.get_mut(&object_id) {
+                attach(file);
+            }
+            for group in self.trashed.values_mut() {
+                if let Some(member) = group
+                    .members
+                    .iter_mut()
+                    .find(|member| i64::from(member.message_id) == file_msg_id)
+                {
+                    attach(member);
+                }
+            }
+        }
+
         // The state a later launch resumes from, taken once the multipart
         // groups have been resolved into the objects that name them.
         let state = ReplayState {
@@ -832,6 +895,7 @@ impl Replay {
             parts: self.parts,
             multipart: BTreeMap::new(),
             vault: self.vault,
+            renditions: self.renditions,
             media: BTreeMap::new(),
         };
 
@@ -1045,7 +1109,7 @@ pub async fn async_upload_file(
     parent: &str,
     name: &str,
     key: Option<[u8; 32]>,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     let plaintext_size = std::fs::metadata(path)
         .map(|meta| meta.len() as i64)
         .unwrap_or_default();
@@ -1119,8 +1183,62 @@ pub async fn async_upload_file(
     if body != path {
         let _ = std::fs::remove_file(&body);
     }
-    sent?;
-    Ok(())
+    let sent = sent?;
+    Ok(sent.id())
+}
+
+/// Publish a derivative beside the file it was made from.
+///
+/// The derivative is its own message: a hidden part whose caption names the
+/// file it belongs to and carries the picture's own dimensions. The original
+/// publishes it the same way, so a derivative this port writes is one the
+/// original reads, and the other way round.
+///
+/// The message id comes back, so a reader can find the picture again.
+pub async fn async_upload_rendition(
+    client: &Client,
+    peer_ref: PeerRef,
+    descriptor: &ops::Rendition,
+    payload: &[u8],
+) -> Result<i32, String> {
+    let op = ops::Op::Part {
+        uuid: uuid::Uuid::new_v4().to_string(),
+        index: 0,
+        size: Some(payload.len() as i64),
+        rendition: Some(descriptor.clone()),
+    };
+    let caption = ops::format(&op);
+    let mut source = std::io::Cursor::new(payload);
+    let uploaded = client
+        .upload_stream(&mut source, payload.len(), "rendition.bin".to_string())
+        .await
+        .map_err(|e| e.to_string())?;
+    let input = grammers_client::message::InputMessage::new()
+        .document(uploaded)
+        .text(caption);
+    let sent = client
+        .send_message(peer_ref, input)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(sent.id())
+}
+
+/// Fetch a derivative's bytes.
+///
+/// A derivative is one small message, so this is the ordinary download with a
+/// single message: the caller knows which one.
+pub async fn async_download_rendition(
+    client: &Client,
+    peer_ref: PeerRef,
+    message_id: i32,
+) -> Result<Vec<u8>, String> {
+    let media = find_media(client, peer_ref, message_id).await?;
+    let mut bytes = Vec::new();
+    let mut chunks = client.iter_download(&media);
+    while let Some(chunk) = chunks.next().await.map_err(|e| e.to_string())? {
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// Encrypt one file into a temporary file and return its path.
@@ -1340,22 +1458,30 @@ async fn async_download_thumbnail(
             .await
             .map_err(|e| e.to_string())?;
     }
-    let mut writer = tokio::fs::File::create(dest)
+    // The picture is written beside its place and renamed into it, so a reader
+    // never sees half a picture: a picture read while it is still being
+    // written is broken, and a broken picture is remembered as broken.
+    let staged = dest.with_extension("tdrive-part");
+    let mut writer = tokio::fs::File::create(&staged)
         .await
         .map_err(|e| e.to_string())?;
     let mut chunks = client.iter_download(&thumb);
     while let Some(chunk) = chunks.next().await.map_err(|e| e.to_string())? {
         if let Err(error) = writer.write_all(&chunk).await {
             drop(writer);
-            let _ = tokio::fs::remove_file(dest).await;
+            let _ = tokio::fs::remove_file(&staged).await;
             return Err(error.to_string());
         }
     }
     if let Err(error) = writer.flush().await {
         drop(writer);
-        let _ = tokio::fs::remove_file(dest).await;
+        let _ = tokio::fs::remove_file(&staged).await;
         return Err(error.to_string());
     }
+    drop(writer);
+    tokio::fs::rename(&staged, dest)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -1477,8 +1603,29 @@ pub fn upload_file(
     parent: &str,
     name: &str,
     key: Option<[u8; 32]>,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     RT.block_on(async_upload_file(client, peer_ref, path, parent, name, key))
+}
+
+/// Publish a derivative beside the file it was made from.
+pub fn upload_rendition(
+    client: &Client,
+    peer_ref: PeerRef,
+    descriptor: &ops::Rendition,
+    payload: &[u8],
+) -> Result<i32, String> {
+    RT.block_on(async_upload_rendition(
+        client, peer_ref, descriptor, payload,
+    ))
+}
+
+/// Fetch a derivative's bytes.
+pub fn download_rendition(
+    client: &Client,
+    peer_ref: PeerRef,
+    message_id: i32,
+) -> Result<Vec<u8>, String> {
+    RT.block_on(async_download_rendition(client, peer_ref, message_id))
 }
 pub fn download_file(
     client: &Client,
@@ -1595,6 +1742,8 @@ mod tests {
             Op::Part {
                 uuid: uuid.to_string(),
                 index,
+                size: None,
+                rendition: None,
             },
         );
         entry.kind = Some(kind);

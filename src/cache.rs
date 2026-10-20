@@ -119,6 +119,7 @@ mod tests {
             parent: String::new(),
             encrypted: false,
             plaintext_size: None,
+            renditions: Vec::new(),
             content: ContentRef::Message(9),
             revision: 0,
         }
