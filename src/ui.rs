@@ -31,7 +31,8 @@ use crate::crypto::{self, VaultMaterial};
 use crate::format::{entry_origin, human_size, purge_countdown, short_date};
 use crate::models::{
     AppState, ContentRef, Crumb, Drive, DriveCandidate, DriveKind, FileKind, LocalState, LoginStep,
-    PURGE_WINDOW_DAYS, RemoteFile, SortKey, SortState, TrashEntry, VaultResume, ViewMode,
+    PURGE_WINDOW_DAYS, Preview, PreviewKind, RemoteFile, SortKey, SortState, TrashEntry,
+    VaultResume, ViewMode, preview_kind,
 };
 use crate::ops::{self, Op};
 use crate::tele;
@@ -488,6 +489,15 @@ impl Render for TDriveView {
             LoginStep::ChooseDrive => self.render_drive_picker(cx),
             _ => self.render_login(cx).into_any_element(),
         };
+        let preview = render_preview(&self.state, {
+            let view = cx.entity();
+            move |cx: &mut App| {
+                view.update(cx, |this, cx| {
+                    this.state.preview = None;
+                    cx.notify();
+                });
+            }
+        });
         let rename_dialog = self.render_rename_dialog(cx);
         let move_dialog = self.render_move_dialog(cx);
         let folder_dialog = self.render_folder_dialog(cx);
@@ -502,6 +512,7 @@ impl Render for TDriveView {
             .bg(theme::canvas())
             .text_color(theme::text_soft())
             .child(content)
+            .children(preview)
             .children(rename_dialog)
             .children(move_dialog)
             .children(folder_dialog)
@@ -2976,9 +2987,13 @@ impl TDriveView {
                         cx.notify();
                     });
                     if activate {
-                        spawn_download(clicking.clone(), index, cx);
+                        // A double click opens the file, the way the original
+                        // does. A kind the viewer cannot show is saved
+                        // instead, which is what the original's viewer does
+                        // with the kinds it cannot open.
+                        spawn_preview(clicking.clone(), index, cx);
                         // A row that is locked raises the unlock prompt instead
-                        // of downloading, so the caret goes straight into it and
+                        // of opening, so the caret goes straight into it and
                         // the passphrase can be typed without a second click.
                         focus_unlock_field(&clicking, window, cx);
                     }
@@ -4791,6 +4806,21 @@ fn submit_vault_password(view: Entity<TDriveView>, cx: &mut App) {
                         });
                     }
                 }
+                VaultResume::Preview => {
+                    if let Some(message_id) = prompt.message_id {
+                        cx.update(|cx| {
+                            let index = view
+                                .read(cx)
+                                .state
+                                .files
+                                .iter()
+                                .position(|file| file.message_id == message_id);
+                            if let Some(index) = index {
+                                spawn_preview(view, index, cx);
+                            }
+                        });
+                    }
+                }
             }
         }
     })
@@ -5289,6 +5319,193 @@ fn delete_selected(view: Entity<TDriveView>, cx: &mut App) {
         format!("Moved {count} items to trash"),
         cx,
     );
+}
+
+/// Open a file for looking at, the way the original's viewer does.
+///
+/// A picture or a text file is fetched and shown; anything else is saved
+/// instead, the way the original's viewer refuses the kinds it cannot open.
+fn spawn_preview(view: Entity<TDriveView>, index: usize, cx: &mut App) {
+    let (client, peer_ref, drive_id, file, key) = {
+        let this = view.read(cx);
+        let Some(drive) = this.state.active_dialog().cloned() else {
+            return;
+        };
+        let Some(file) = this.state.files.get(index).cloned() else {
+            return;
+        };
+        (
+            this.state.tele.clone(),
+            drive.peer_ref,
+            drive.id,
+            file,
+            this.state.vault.as_ref().and_then(|vault| vault.key),
+        )
+    };
+
+    // The viewer can show a picture or a text file; the rest is saved.
+    let Some(kind) = preview_kind(&file.name) else {
+        spawn_download(view, index, cx);
+        return;
+    };
+
+    // An encrypted file cannot be read without the drive's key, so ask for it
+    // first; a successful unlock resumes the preview by itself.
+    if file.encrypted && key.is_none() {
+        view.update(cx, |this, cx| {
+            this.state
+                .request_vault_for(VaultResume::Preview, Some(file.message_id));
+            this.state.status = format!("{} is encrypted", file.name);
+            cx.notify();
+        });
+        return;
+    }
+
+    let Some(client) = client else {
+        view.update(cx, |this, cx| {
+            this.state.status = "Connect to Telegram to open the file".to_string();
+            cx.notify();
+        });
+        return;
+    };
+
+    let name = file.name.clone();
+    let meta = format!(
+        "{} · {}",
+        file.kind.label(&name),
+        human_size(file.display_size())
+    );
+    let messages = content_messages(&file);
+    let dest = preview_path(&file);
+    let key_for_task = if file.encrypted { key } else { None };
+    view.update(cx, |this, cx| {
+        this.state.status = format!("Opening {name}...");
+        cx.notify();
+    });
+
+    cx.spawn(async move |cx| {
+        let dest_for_task = dest.clone();
+        let result = cx
+            .background_spawn(async move {
+                tele::download_file(&client, peer_ref, &messages, &dest_for_task, key_for_task)
+            })
+            .await;
+        // A text file is read once here, so the viewer does not read it again
+        // on every frame. A long file is cut short rather than filling the
+        // screen with a wall of text.
+        let text = match (kind, &result) {
+            (PreviewKind::Text, Ok(())) => std::fs::read_to_string(&dest).ok().map(|body| {
+                let mut text: String = body.chars().take(TEXT_PREVIEW_CHARS).collect();
+                if body.chars().count() > TEXT_PREVIEW_CHARS {
+                    text.push_str("\n\n… the file is longer than this");
+                }
+                text
+            }),
+            _ => None,
+        };
+        cx.update(|cx| {
+            view.update(cx, |this, cx| {
+                // A drive switch replaces the whole list, so the file that was
+                // opened is only still there if the drive is.
+                if this.state.active_dialog().map(|d| d.id) != Some(drive_id) {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        this.state.preview = Some(Preview {
+                            kind,
+                            title: name.clone(),
+                            meta,
+                            path: dest.clone(),
+                            text,
+                        });
+                        this.state.status = format!("Opened {name}");
+                    }
+                    Err(message) => {
+                        this.state.status =
+                            format!("Could not open the file: {}", truncate(&message, 80));
+                        this.state.error = Some(message);
+                    }
+                }
+                cx.notify();
+            });
+        });
+    })
+    .detach();
+}
+
+/// How much of a text file the viewer shows, so a long log does not fill
+/// the screen.
+const TEXT_PREVIEW_CHARS: usize = 200_000;
+
+/// Where an opened file is kept, so the same file is not fetched twice.
+fn preview_path(file: &RemoteFile) -> PathBuf {
+    directories::ProjectDirs::from("", "", "tdrive")
+        .map(|dirs| dirs.cache_dir().join("preview"))
+        .unwrap_or_else(|| PathBuf::from(".tdrive-preview"))
+        .join(format!("{}-{}", file.message_id, sanitize_name(&file.name)))
+}
+
+/// The viewer, drawn over the shell while a file is open.
+fn render_preview(state: &AppState, close: impl Fn(&mut App) + 'static) -> Option<AnyElement> {
+    let preview = state.preview.clone()?;
+    let title = preview.title.clone();
+    let meta = preview.meta.clone();
+    let body = match preview.kind {
+        // The picture is fitted into a box of a fixed height, so a large one
+        // is scaled down rather than pushing the viewer off the screen, and a
+        // small one keeps its own size.
+        PreviewKind::Image => img(preview.path.clone())
+            .w_full()
+            .h(px(520.))
+            .object_fit(ObjectFit::Contain)
+            .into_any_element(),
+        PreviewKind::Text => div()
+            .id("preview-text")
+            .w_full()
+            .max_h(px(560.))
+            .overflow_y_scroll()
+            .font_family("monospace")
+            .text_size(px(theme::TYPE_SM))
+            .text_color(theme::text())
+            .child(preview.text.unwrap_or_default())
+            .into_any_element(),
+    };
+    Some(modal_scrim(
+        modal_card(760.)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(px(theme::TYPE_MD))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text())
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(theme::TYPE_XS))
+                                    .text_color(theme::text_muted())
+                                    .child(meta),
+                            ),
+                    )
+                    .child(
+                        Button::new("preview-close")
+                            .ghost()
+                            .label("Close")
+                            .on_click(move |_, _window, cx| close(cx)),
+                    ),
+            )
+            .child(body),
+    ))
 }
 
 /// Put a trashed item back in the drive it came from.

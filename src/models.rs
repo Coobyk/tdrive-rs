@@ -224,6 +224,48 @@ impl RemoteFile {
     }
 }
 
+/// What the viewer shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewKind {
+    /// A picture, drawn from the file.
+    Image,
+    /// Text, shown as text.
+    Text,
+}
+
+/// A file opened for looking at, while the viewer is up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preview {
+    pub kind: PreviewKind,
+    /// The name of the file, which titles the viewer.
+    pub title: String,
+    /// What the viewer says about the file: its kind and its size, the way the
+    /// original names them.
+    pub meta: String,
+    /// Where the bytes were written, so the viewer can read them.
+    pub path: PathBuf,
+    /// The text of a text file, read once so the viewer does not read it again
+    /// on every frame.
+    pub text: Option<String>,
+}
+
+/// Whether a file can be looked at, and how.
+///
+/// The original decides from the name, and so does this: a picture is drawn
+/// and a text file is shown, while anything else is saved rather than opened.
+pub fn preview_kind(name: &str) -> Option<PreviewKind> {
+    let extension = name.rsplit_once('.')?.1.to_lowercase();
+    match extension.as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "avif" | "tiff" | "tif" => {
+            Some(PreviewKind::Image)
+        }
+        "txt" | "md" | "markdown" | "log" | "json" | "csv" | "toml" | "yaml" | "yml" | "ini"
+        | "conf" | "cfg" | "html" | "htm" | "css" | "js" | "ts" | "rs" | "py" | "go" | "c"
+        | "h" | "cpp" | "hpp" | "java" | "sh" | "xml" | "sql" | "env" => Some(PreviewKind::Text),
+        _ => None,
+    }
+}
+
 /// Where a row is in the download lifecycle, so the list can show progress
 /// rather than a static "downloaded" line in a status bar.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -395,6 +437,8 @@ pub enum VaultResume {
     Upload,
     /// A row that was being opened or downloaded.
     Open,
+    /// A file that was being looked at.
+    Preview,
     /// A rename the drive will not take while the file is locked.
     Rename,
     /// A move, for the same reason.
@@ -597,6 +641,8 @@ pub struct AppState {
     pub selection_anchor: Option<usize>,
     /// The rows still to be downloaded, when a batch of them was started.
     pub download_queue: Vec<usize>,
+    /// The file open in the viewer, while it is up.
+    pub preview: Option<Preview>,
     /// The row asking for a new name, while the rename dialog is open.
     pub pending_rename: Option<RenameTarget>,
     /// The row asking for a new home, while the move dialog is open.
@@ -658,6 +704,7 @@ impl Default for AppState {
             vault: None,
             encryption_setup: None,
             upload_options: None,
+            preview: None,
             selected_objects: BTreeSet::new(),
             selection_anchor: None,
             download_queue: Vec::new(),
@@ -1138,7 +1185,7 @@ impl AppState {
             VaultResume::Upload => self.pending_upload = None,
             VaultResume::Rename => self.pending_rename = None,
             VaultResume::Move => self.close_move(),
-            VaultResume::Nothing | VaultResume::Open => {}
+            VaultResume::Nothing | VaultResume::Open | VaultResume::Preview => {}
         }
     }
 
@@ -1724,6 +1771,20 @@ mod tests {
             kind: FileKind::Folder,
             ..file(message_id, name, 0, parent)
         }
+    }
+
+    /// The viewer opens what it can show and saves the rest, deciding from the
+    /// name the way the original does.
+    #[test]
+    fn the_viewer_knows_what_it_can_show() {
+        assert_eq!(preview_kind("holiday.JPG"), Some(PreviewKind::Image));
+        assert_eq!(preview_kind("notes.txt"), Some(PreviewKind::Text));
+        assert_eq!(preview_kind("main.rs"), Some(PreviewKind::Text));
+        // A picture the viewer cannot draw, and a file it does not know, are
+        // saved rather than opened.
+        assert_eq!(preview_kind("clip.mp4"), None);
+        assert_eq!(preview_kind("data.bin"), None);
+        assert_eq!(preview_kind("noextension"), None);
     }
 
     /// A click picks one row, a modified click adds to the set and a
