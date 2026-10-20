@@ -1082,8 +1082,12 @@ impl TDriveView {
         let blocked = self.state.move_blocked();
         let folders = self.state.folders_in(&current_id);
         let can_move = self.state.move_available() && !working;
-        let at_source = current_id == target.parent;
-        let title = format!("Move \"{}\"", target.name);
+        let at_source = current_id == self.state.move_source_parent();
+        let title = if target.items.len() == 1 {
+            format!("Move \"{}\"", target.items[0].name)
+        } else {
+            format!("Move {} items", target.items.len())
+        };
         let view = cx.entity();
 
         // The trail down to the folder being browsed: the drive's name first,
@@ -2123,7 +2127,12 @@ impl TDriveView {
         } else {
             "Date"
         };
+        // While rows are picked, the header is covered by a bar that names
+        // how many there are and offers what can be done with them, which is
+        // where the original puts its selection bar.
+        let picked = self.state.selected_objects.len();
         let table_header = div()
+            .relative()
             .h(px(theme::TABLE_HEADER_H))
             .flex_shrink_0()
             .flex()
@@ -2159,7 +2168,8 @@ impl TDriveView {
                     .w(px(theme::COL_ACTIONS_W))
                     .flex_shrink_0()
                     .child("Actions"),
-            );
+            )
+            .children((picked > 0).then(|| selection_bar(view.clone(), picked)));
 
         let banner = error.map(|message| {
             div()
@@ -2720,7 +2730,7 @@ impl TDriveView {
     fn render_file_row(&self, index: usize, view: &Entity<TDriveView>) -> AnyElement {
         let view = view.clone();
         let file = self.state.files[index].clone();
-        let selected = self.state.selected_file == Some(index);
+        let selected = self.state.is_selected(index);
         let confirming = self.state.pending_delete == Some(file.message_id);
         // A folder opens rather than downloading, so it carries no row actions.
         let is_folder = file.is_folder();
@@ -2897,13 +2907,19 @@ impl TDriveView {
                     // describes. Activation is what asks for the drive's key,
                     // because an encrypted file cannot be read before it.
                     let activate = event.click_count() >= 2;
+                    // The keys held with the click, which is how the original
+                    // tells a plain pick from a range or a toggle.
+                    let modifiers = event.modifiers();
+                    // The rows on screen, which is the order a range
+                    // selection follows.
+                    let rows = visible_rows(&clicking, cx);
                     // A search result can live in any folder, so activating one
                     // goes to where it is instead of acting on it in place,
                     // which is the original's `openFileResult`.
                     let searching = clicking.read(cx).state.searching();
                     if searching {
                         clicking.update(cx, |this, cx| {
-                            this.state.selected_file = Some(index);
+                            pick_row(&mut this.state, index, &modifiers, &rows);
                             this.state.pending_delete = None;
                             cx.notify();
                         });
@@ -2937,6 +2953,14 @@ impl TDriveView {
                         return;
                     }
                     if is_folder {
+                        // A folder is picked like anything else; a double
+                        // click opens it, which is the split the original
+                        // makes between selecting a row and activating it.
+                        clicking.update(cx, |this, cx| {
+                            pick_row(&mut this.state, index, &modifiers, &rows);
+                            this.state.pending_delete = None;
+                            cx.notify();
+                        });
                         if activate {
                             clicking.update(cx, |this, cx| {
                                 this.state
@@ -2947,7 +2971,7 @@ impl TDriveView {
                         return;
                     }
                     clicking.update(cx, |this, cx| {
-                        this.state.selected_file = Some(index);
+                        pick_row(&mut this.state, index, &modifiers, &rows);
                         this.state.pending_delete = None;
                         cx.notify();
                     });
@@ -3155,6 +3179,105 @@ impl TDriveView {
 }
 
 // --- Header pieces ----------------------------------------------------------
+
+/// The bar that covers the table's header while rows are picked.
+///
+/// The original draws the count on the left and the actions on the right, so
+/// the column labels step aside for it while a selection is live.
+fn selection_bar(view: Entity<TDriveView>, count: usize) -> AnyElement {
+    let label = if count == 1 {
+        "1 selected".to_string()
+    } else {
+        format!("{count} selected")
+    };
+    let download_view = view.clone();
+    let move_view = view.clone();
+    let delete_view = view.clone();
+    let clear_view = view.clone();
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px(px(30.))
+        .bg(theme::canvas())
+        .child(
+            div()
+                .text_size(px(theme::TYPE_SM))
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme::text())
+                .child(label),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    Button::new("selection-download")
+                        .label("Download")
+                        .on_click(move |_, _window, cx| {
+                            download_selected(download_view.clone(), cx);
+                        }),
+                )
+                .child(Button::new("selection-move").label("Move").on_click(
+                    move |_, _window, cx| {
+                        move_selected(move_view.clone(), cx);
+                    },
+                ))
+                .child(
+                    Button::new("selection-delete")
+                        .danger()
+                        .label("Delete")
+                        .on_click(move |_, _window, cx| {
+                            delete_selected(delete_view.clone(), cx);
+                        }),
+                )
+                .child(
+                    Button::new("selection-clear")
+                        .ghost()
+                        .label("Clear")
+                        .on_click(move |_, _window, cx| {
+                            clear_view.update(cx, |this, cx| {
+                                this.state.clear_selection();
+                                cx.notify();
+                            });
+                        }),
+                ),
+        )
+        .into_any_element()
+}
+
+/// The rows the list is showing, in the order it shows them.
+///
+/// A shift-click takes the range between the anchor and a row, so the range
+/// has to follow the order on screen rather than the order of the drive.
+fn visible_rows(view: &Entity<TDriveView>, cx: &App) -> Vec<usize> {
+    view.read(cx)
+        .rows_cache
+        .borrow()
+        .as_ref()
+        .map(|cache| cache.rows.as_ref().clone())
+        .unwrap_or_default()
+}
+
+/// Pick a row the way the original's selection does: a plain click takes it
+/// alone, a modified click adds it to the set or takes it out again, and a
+/// shift-click takes everything between the anchor and the row.
+fn pick_row(state: &mut AppState, index: usize, modifiers: &gpui::Modifiers, rows: &[usize]) {
+    if modifiers.shift {
+        state.select_range(rows, index);
+    } else if modifiers.control || modifiers.platform {
+        state.toggle_selected(index);
+    } else {
+        state.select_only(index);
+    }
+}
 
 fn sort_button(
     view: Entity<TDriveView>,
@@ -3960,6 +4083,8 @@ fn apply_contents(state: &mut AppState, title: &str, result: Result<DriveContent
         Ok(contents) => {
             let count = contents.files.len();
             state.files = contents.files;
+            // The rows the selection named may not be there any more.
+            state.clear_selection();
             // The drive's own trash is part of what was read, so the Trash view
             // shows what the *drive* deleted, not only what this session did.
             state.trash = contents
@@ -4342,6 +4467,9 @@ fn spawn_download(view: Entity<TDriveView>, index: usize, cx: &mut App) {
                 cx.notify();
             });
         });
+        // A batch continues with the next file, so a handful of them arrive
+        // one after another rather than all at once.
+        cx.update(|cx| next_download(view.clone(), cx));
     })
     .detach();
 }
@@ -4898,7 +5026,7 @@ fn commit_rename(view: Entity<TDriveView>, cx: &mut App) {
 
 /// Take the destination the move dialog is pointing at.
 fn commit_move(view: Entity<TDriveView>, cx: &mut App) {
-    let (target, destination, destination_name, demo, key, has_client) = {
+    let (items, destination, destination_name, demo, key, has_client) = {
         let this = view.read(cx);
         let Some(target) = this.state.pending_move.clone() else {
             return;
@@ -4913,7 +5041,7 @@ fn commit_move(view: Entity<TDriveView>, cx: &mut App) {
             .map(|crumb| (crumb.id.clone(), crumb.name.clone()))
             .unwrap_or_default();
         (
-            target,
+            target.items,
             destination,
             destination_name,
             this.state.demo,
@@ -4921,17 +5049,18 @@ fn commit_move(view: Entity<TDriveView>, cx: &mut App) {
             this.state.tele.is_some(),
         )
     };
+    if items.is_empty() {
+        return;
+    }
 
-    let encrypted = view
-        .read(cx)
-        .state
-        .files
-        .iter()
-        .any(|file| file.message_id == target.message_id && file.encrypted);
-    if encrypted && key.is_none() {
+    // The drive refuses to move an encrypted file while its key is missing, so
+    // a locked row asks for the passphrase and the move picks up again once
+    // the key is known.
+    let locked = items.iter().find(|item| item.encrypted);
+    if locked.is_some() && key.is_none() {
+        let message_id = items.first().map(|item| item.message_id);
         view.update(cx, |this, cx| {
-            this.state
-                .request_vault_for(VaultResume::Move, Some(target.message_id));
+            this.state.request_vault_for(VaultResume::Move, message_id);
             if let Some(pending) = this.state.pending_move.as_mut() {
                 pending.working = true;
             }
@@ -4943,9 +5072,11 @@ fn commit_move(view: Entity<TDriveView>, cx: &mut App) {
     if !has_client {
         if demo {
             view.update(cx, |this, cx| {
-                this.state.move_local(&target.object_id, &destination);
+                for item in &items {
+                    this.state.move_local(&item.object_id, &destination);
+                }
                 this.state.close_move();
-                this.state.status = format!("Moved {} to {destination_name}", target.name);
+                this.state.status = format!("Moved {} to {destination_name}", describe(&items));
                 cx.notify();
             });
         }
@@ -4958,14 +5089,28 @@ fn commit_move(view: Entity<TDriveView>, cx: &mut App) {
         }
         cx.notify();
     });
-    let op = ops::move_op(&target.object_id, &destination);
+    // Each row is moved on its own, the way the original's move writes one
+    // operation per item.
+    let ops: Vec<Op> = items
+        .iter()
+        .map(|item| ops::move_op(&item.object_id, &destination))
+        .collect();
     spawn_write(
         view,
-        vec![op],
+        ops,
         Vec::new(),
-        format!("Moved {} to {destination_name}", target.name),
+        format!("Moved {} to {destination_name}", describe(&items)),
         cx,
     );
+}
+
+/// How a batch of rows is named in a message: the name of the one row, or the
+/// count of the many, the way the original names them.
+fn describe(items: &[crate::models::MoveItem]) -> String {
+    match items {
+        [one] => one.name.clone(),
+        many => format!("{} items", many.len()),
+    }
 }
 
 /// Create the folder named in the "New folder" dialog.
@@ -5005,6 +5150,145 @@ fn commit_folder(view: Entity<TDriveView>, cx: &mut App) {
     let object_id = ops::new_folder_id();
     let op = ops::mkdir_op(&object_id, &parent, &name);
     spawn_write(view, vec![op], Vec::new(), format!("Created {name}"), cx);
+}
+
+/// Download every picked row, one after another.
+///
+/// The original queues a batch in its transfers panel; this walks the same
+/// list one file at a time, so a drive is never asked for a dozen files at
+/// once.
+fn download_selected(view: Entity<TDriveView>, cx: &mut App) {
+    let rows = {
+        let this = view.read(cx);
+        this.state.selected_rows()
+    };
+    // A folder has no body of its own to fetch, so it is left out rather than
+    // counted and then silently skipped.
+    let rows: Vec<usize> = rows
+        .into_iter()
+        .filter(|index| {
+            view.read(cx)
+                .state
+                .files
+                .get(*index)
+                .is_some_and(|file| !file.is_folder())
+        })
+        .collect();
+    if rows.is_empty() {
+        view.update(cx, |this, cx| {
+            this.state.status = "Nothing to download".to_string();
+            cx.notify();
+        });
+        return;
+    }
+    view.update(cx, |this, cx| {
+        this.state.download_queue = rows[1..].to_vec();
+        this.state.status = format!("Downloading {} files", rows.len());
+        cx.notify();
+    });
+    spawn_download(view, rows[0], cx);
+}
+
+/// The next file of a batch download, if there is one left.
+fn next_download(view: Entity<TDriveView>, cx: &mut App) {
+    let next = {
+        let this = view.read(cx);
+        this.state.download_queue.first().copied()
+    };
+    let Some(index) = next else {
+        return;
+    };
+    view.update(cx, |this, cx| {
+        if !this.state.download_queue.is_empty() {
+            this.state.download_queue.remove(0);
+        }
+        cx.notify();
+    });
+    spawn_download(view, index, cx);
+}
+
+/// Move every picked row, through the picker a single row uses.
+fn move_selected(view: Entity<TDriveView>, cx: &mut App) {
+    let files = {
+        let this = view.read(cx);
+        this.state
+            .selected_rows()
+            .into_iter()
+            .filter_map(|index| this.state.files.get(index).cloned())
+            .collect::<Vec<_>>()
+    };
+    if files.is_empty() {
+        return;
+    }
+    view.update(cx, |this, cx| {
+        this.state.close_rename();
+        this.state.begin_move_many(&files);
+        cx.notify();
+    });
+}
+
+/// Move every picked row to the trash.
+///
+/// Each row is its own operation, the way the original's bulk delete writes
+/// one delete per item rather than one operation naming them all.
+fn delete_selected(view: Entity<TDriveView>, cx: &mut App) {
+    let (client, files, demo) = {
+        let this = view.read(cx);
+        (
+            this.state.tele.clone(),
+            this.state
+                .selected_rows()
+                .into_iter()
+                .filter_map(|index| this.state.files.get(index).cloned())
+                .collect::<Vec<_>>(),
+            this.state.demo,
+        )
+    };
+    if files.is_empty() {
+        return;
+    }
+    let count = files.len();
+    if client.is_none() {
+        if demo {
+            view.update(cx, |this, cx| {
+                let title = this
+                    .state
+                    .active_dialog()
+                    .map(|drive| drive.title.clone())
+                    .unwrap_or_default();
+                for file in &files {
+                    move_file_to_trash(&mut this.state, file.message_id, &title);
+                }
+                this.state.clear_selection();
+                this.state.status = format!("Moved {count} items to trash");
+                cx.notify();
+            });
+        }
+        return;
+    }
+    let now = Utc::now().timestamp();
+    let ops: Vec<Op> = files
+        .iter()
+        .map(|file| {
+            ops::trash_op(
+                &file.object_id,
+                file.revision,
+                now,
+                PURGE_WINDOW_DAYS * 86_400,
+            )
+        })
+        .collect();
+    view.update(cx, |this, cx| {
+        this.state.clear_selection();
+        cx.notify();
+    });
+    spawn_write(
+        view,
+        ops,
+        Vec::new(),
+        format!("Moved {count} items to trash"),
+        cx,
+    );
 }
 
 /// Put a trashed item back in the drive it came from.

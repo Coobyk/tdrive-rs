@@ -418,15 +418,40 @@ pub struct RenameTarget {
     pub working: bool,
 }
 
-/// The row a move dialog is moving, while it is open.
+/// One row taking part in a move.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MoveTarget {
+pub struct MoveItem {
     pub object_id: String,
     pub message_id: i32,
     pub name: String,
     /// The folder it sits in now, which is not offered as a destination.
     pub parent: String,
     pub is_folder: bool,
+    /// True when the drive holds the file encrypted, which is what the drive
+    /// asks the key for before it will move it.
+    pub encrypted: bool,
+}
+
+impl MoveItem {
+    fn from_file(file: &RemoteFile) -> Self {
+        Self {
+            object_id: file.object_id.clone(),
+            message_id: file.message_id,
+            name: file.name.clone(),
+            parent: file.parent.clone(),
+            is_folder: file.is_folder(),
+            encrypted: file.encrypted,
+        }
+    }
+}
+
+/// The rows a move dialog is moving, while it is open.
+///
+/// A move can carry a whole selection, the way the original's does, so the
+/// dialog names the count rather than one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveTarget {
+    pub items: Vec<MoveItem>,
     pub working: bool,
 }
 
@@ -562,6 +587,16 @@ pub struct AppState {
     pub encryption_setup: Option<EncryptionSetup>,
     /// The upload options modal, while it is open.
     pub upload_options: Option<UploadOptions>,
+    /// The rows the user has picked, by the drive's own object id.
+    ///
+    /// The original keys its selection by a row key and keeps it while the
+    /// list is redrawn; an object id is the same kind of key, and it survives
+    /// the list being rebuilt, which a row index would not.
+    pub selected_objects: BTreeSet<String>,
+    /// The row a shift-click extends the selection from.
+    pub selection_anchor: Option<usize>,
+    /// The rows still to be downloaded, when a batch of them was started.
+    pub download_queue: Vec<usize>,
     /// The row asking for a new name, while the rename dialog is open.
     pub pending_rename: Option<RenameTarget>,
     /// The row asking for a new home, while the move dialog is open.
@@ -623,6 +658,9 @@ impl Default for AppState {
             vault: None,
             encryption_setup: None,
             upload_options: None,
+            selected_objects: BTreeSet::new(),
+            selection_anchor: None,
+            download_queue: Vec::new(),
             pending_rename: None,
             pending_move: None,
             move_path: Vec::new(),
@@ -773,6 +811,82 @@ impl AppState {
         }
     }
 
+    /// Whether a row is part of the selection.
+    pub fn is_selected(&self, index: usize) -> bool {
+        self.files
+            .get(index)
+            .is_some_and(|file| self.selected_objects.contains(&file.object_id))
+    }
+
+    /// Select one row and nothing else, the way a plain click does.
+    pub fn select_only(&mut self, index: usize) {
+        self.selected_objects.clear();
+        if let Some(file) = self.files.get(index) {
+            self.selected_objects.insert(file.object_id.clone());
+        }
+        self.selection_anchor = Some(index);
+        self.selected_file = Some(index);
+    }
+
+    /// Add a row to the selection or take it out again, the way a modified
+    /// click does.
+    pub fn toggle_selected(&mut self, index: usize) {
+        let Some(file) = self.files.get(index).cloned() else {
+            return;
+        };
+        if !self.selected_objects.remove(&file.object_id) {
+            self.selected_objects.insert(file.object_id);
+        }
+        self.selection_anchor = Some(index);
+        self.selected_file = Some(index);
+    }
+
+    /// Select every row between the anchor and a row, the way a shift-click
+    /// does. The rows are the list's own order, so the range covers what the
+    /// reader can see.
+    pub fn select_range(&mut self, rows: &[usize], index: usize) {
+        let Some(anchor) = self.selection_anchor else {
+            self.select_only(index);
+            return;
+        };
+        let Some(start) = rows.iter().position(|row| *row == anchor) else {
+            self.select_only(index);
+            return;
+        };
+        let Some(end) = rows.iter().position(|row| *row == index) else {
+            return;
+        };
+        let (from, to) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        self.selected_objects.clear();
+        for row in &rows[from..=to] {
+            if let Some(file) = self.files.get(*row) {
+                self.selected_objects.insert(file.object_id.clone());
+            }
+        }
+        self.selected_file = Some(index);
+    }
+
+    /// Forget the selection, which is what leaving a folder or re-reading the
+    /// drive does: the rows it named may not be there any more.
+    pub fn clear_selection(&mut self) {
+        self.selected_objects.clear();
+        self.selection_anchor = None;
+    }
+
+    /// The selected rows, in the order the list shows them.
+    pub fn selected_rows(&self) -> Vec<usize> {
+        self.files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| self.selected_objects.contains(&file.object_id))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     /// Open the rename dialog on a live row.
     pub fn begin_rename(&mut self, file: &RemoteFile) {
         self.pending_rename = Some(RenameTarget {
@@ -791,17 +905,19 @@ impl AppState {
     /// Open the move dialog on a live row, listing the drive from its root the
     /// way the original's picker starts there.
     pub fn begin_move(&mut self, file: &RemoteFile) {
+        self.begin_move_many(std::slice::from_ref(file));
+    }
+
+    /// Open the move dialog on a set of rows, the way the original's picker
+    /// takes a whole selection.
+    pub fn begin_move_many(&mut self, files: &[RemoteFile]) {
         let root = self
             .active_dialog()
             .map(|drive| drive.title.clone())
             .unwrap_or_else(|| "My Drive".to_string());
         self.move_path = vec![Crumb::root(&root)];
         self.pending_move = Some(MoveTarget {
-            object_id: file.object_id.clone(),
-            message_id: file.message_id,
-            name: file.name.clone(),
-            parent: file.parent.clone(),
-            is_folder: file.is_folder(),
+            items: files.iter().map(MoveItem::from_file).collect(),
             working: false,
         });
     }
@@ -840,10 +956,11 @@ impl AppState {
         let Some(target) = self.pending_move.as_ref() else {
             return blocked;
         };
-        if !target.is_folder {
-            return blocked;
+        for item in &target.items {
+            if item.is_folder {
+                blocked.insert(item.object_id.clone());
+            }
         }
-        blocked.insert(target.object_id.clone());
         // A child of a blocked folder is blocked as well, so the walk repeats
         // until the set stops growing rather than trusting the rows' order.
         loop {
@@ -866,11 +983,21 @@ impl AppState {
 
     /// Whether the move dialog can land where it is looking.
     pub fn move_available(&self) -> bool {
-        let Some(target) = self.pending_move.as_ref() else {
+        if self.pending_move.is_none() {
             return false;
-        };
+        }
         let destination = self.move_current();
-        destination != target.parent && !self.move_blocked().contains(destination)
+        destination != self.move_source_parent() && !self.move_blocked().contains(destination)
+    }
+
+    /// The folder the moved rows sit in now, which the picker refuses as a
+    /// destination because the items are already there.
+    pub fn move_source_parent(&self) -> &str {
+        self.pending_move
+            .as_ref()
+            .and_then(|target| target.items.first())
+            .map(|item| item.parent.as_str())
+            .unwrap_or("")
     }
 
     /// Rename a live row in place, which is what the demo walks without a
@@ -1597,6 +1724,86 @@ mod tests {
             kind: FileKind::Folder,
             ..file(message_id, name, 0, parent)
         }
+    }
+
+    /// A click picks one row, a modified click adds to the set and a
+    /// shift-click takes the rows in between, the way the original's selection
+    /// does.
+    #[test]
+    fn a_click_picks_rows_the_way_the_original_does() {
+        let mut state = AppState {
+            files: vec![
+                file(1, "one.txt", 1, ""),
+                file(2, "two.txt", 2, ""),
+                file(3, "three.txt", 3, ""),
+            ],
+            ..AppState::default()
+        };
+
+        // A plain click takes one row and forgets the rest.
+        state.select_only(1);
+        assert!(state.is_selected(1));
+        assert!(!state.is_selected(0));
+        assert_eq!(state.selected_rows(), vec![1]);
+
+        // A modified click adds a row without losing the first.
+        state.toggle_selected(2);
+        assert_eq!(state.selected_rows(), vec![1, 2]);
+
+        // And again takes it out.
+        state.toggle_selected(1);
+        assert_eq!(state.selected_rows(), vec![2]);
+
+        // A shift-click takes everything between the anchor and the row.
+        state.select_only(0);
+        state.select_range(&[0, 1, 2], 2);
+        assert_eq!(state.selected_rows(), vec![0, 1, 2]);
+
+        // A range backwards takes the same rows.
+        state.select_only(2);
+        state.select_range(&[0, 1, 2], 0);
+        assert_eq!(state.selected_rows(), vec![0, 1, 2]);
+
+        // And the selection can be forgotten.
+        state.clear_selection();
+        assert!(state.selected_rows().is_empty());
+    }
+
+    /// A move can carry a whole selection, and the picker refuses the folders
+    /// that are in it and everything under them.
+    #[test]
+    fn a_move_carries_a_whole_selection() {
+        let mut state = AppState {
+            files: vec![
+                folder(1, "top", ""),
+                folder(2, "middle", "d:1"),
+                folder(3, "bottom", "d:2"),
+                folder(4, "elsewhere", ""),
+                file(5, "note.txt", 1, ""),
+            ],
+            ..AppState::default()
+        };
+
+        let moving: Vec<RemoteFile> = vec![state.files[0].clone(), state.files[4].clone()];
+        state.begin_move_many(&moving);
+        assert_eq!(
+            state.pending_move.as_ref().map(|target| target.items.len()),
+            Some(2)
+        );
+
+        // The moved folder and everything under it cannot be a destination.
+        let blocked = state.move_blocked();
+        assert!(blocked.contains("d:1") && blocked.contains("d:2"));
+        assert!(!blocked.contains("d:4"));
+
+        // The rows are already in the drive's root, so it is not a destination
+        // either.
+        assert!(!state.move_available());
+        state.move_path.push(Crumb {
+            id: "d:4".to_string(),
+            name: "elsewhere".to_string(),
+        });
+        assert!(state.move_available());
     }
 
     /// The move picker lists folders only, and only those directly beneath the
