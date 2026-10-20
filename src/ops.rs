@@ -1134,6 +1134,42 @@ pub fn purge_op(object_id: &str, revision: i64) -> Op {
     }
 }
 
+/// A rename: the original's `projection.RenameOp`, which changes an object's
+/// display name in place. It names the object and the new name and nothing
+/// else, because the drive remembers where the object lives.
+pub fn rename_op(object_id: &str, name: &str) -> Op {
+    Op::Rename {
+        obj: object_id.to_string(),
+        name: name.to_string(),
+    }
+}
+
+/// A move: the original's `projection.MoveOp`, which reparents an object
+/// without touching its name.
+pub fn move_op(object_id: &str, parent: &str) -> Op {
+    Op::Move {
+        obj: object_id.to_string(),
+        parent: parent.to_string(),
+    }
+}
+
+/// A new folder: the original's `projection.Op{Type: OpMkdir}`, whose object id
+/// is a fresh `d:<uuid>` rather than the message it travels in, so the folder
+/// keeps its identity even if the message is reposted.
+pub fn mkdir_op(object_id: &str, parent: &str, name: &str) -> Op {
+    Op::Folder {
+        obj: object_id.to_string(),
+        parent: parent.to_string(),
+        name: name.to_string(),
+    }
+}
+
+/// A fresh folder object id, matching the original's
+/// `projection.FolderIDPrefix + uuid.NewString()`.
+pub fn new_folder_id() -> String {
+    format!("{FOLDER_ID_PREFIX}{}", uuid::Uuid::new_v4())
+}
+
 /// `f:<v>`: build a file object id, matching Go's `FileIDPrefix`.
 pub fn file_obj_id(v: &str) -> String {
     format!("{FILE_ID_PREFIX}{v}")
@@ -2527,5 +2563,46 @@ mod tests {
             format(&purge_op("f:2", 4)),
             "TDX1|t=harddel|v=1|oid=purge-fe467995d69f3f41ae7b23eb64968cc4|obj=f:2|rev=4"
         );
+    }
+
+    /// The three file-management headers, pinned as text for the same reason:
+    /// `obj`, `p` and `n` are the whole operation, and the drive ignores any
+    /// other spelling of them.
+    #[test]
+    fn a_new_folder_a_rename_and_a_move_are_written_the_way_the_drive_reads_them() {
+        assert_eq!(
+            format(&mkdir_op("d:goa-uuid", "", "Goa Trip")),
+            "TDX1|t=mkdir|obj=d:goa-uuid|p=|n=Goa+Trip"
+        );
+        assert_eq!(
+            format(&rename_op("f:42", "new.png")),
+            "TDX1|t=rename|obj=f:42|n=new.png"
+        );
+        assert_eq!(
+            format(&move_op("f:42", "d:abc")),
+            "TDX1|t=move|obj=f:42|p=d:abc"
+        );
+        // A rename names either kind of object, so a folder keeps its own
+        // `d:` id.
+        assert_eq!(
+            format(&rename_op("d:abc", "Goa")),
+            "TDX1|t=rename|obj=d:abc|n=Goa"
+        );
+    }
+
+    /// A new folder's id is a fresh `d:<uuid>`, the durable identity the
+    /// original mints rather than the message it travels in.
+    #[test]
+    fn a_new_folder_id_is_a_fresh_uuid_under_the_folder_prefix() {
+        let first = new_folder_id();
+        let second = new_folder_id();
+        assert!(first.starts_with("d:"));
+        assert!(second.starts_with("d:"));
+        assert_ne!(first, second);
+        // The rest is a 36-character UUID, so the id is the prefix plus 36.
+        assert_eq!(first.len(), 2 + 36);
+        assert!(uuid::Uuid::parse_str(&first[2..]).is_ok());
+        assert!(is_folder_obj(&first));
+        assert!(!is_file_obj(&first));
     }
 }

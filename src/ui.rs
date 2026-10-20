@@ -30,8 +30,8 @@ use crate::config::{self, DEFAULT_CHANNEL_ABOUT, DEFAULT_CHANNEL_TITLE, DriveCon
 use crate::crypto::{self, VaultMaterial};
 use crate::format::{entry_origin, human_size, purge_countdown, short_date};
 use crate::models::{
-    AppState, ContentRef, Drive, DriveCandidate, DriveKind, FileKind, LocalState, LoginStep,
-    PURGE_WINDOW_DAYS, RemoteFile, SortKey, SortState, TrashEntry, ViewMode,
+    AppState, ContentRef, Crumb, Drive, DriveCandidate, DriveKind, FileKind, LocalState, LoginStep,
+    PURGE_WINDOW_DAYS, RemoteFile, SortKey, SortState, TrashEntry, VaultResume, ViewMode,
 };
 use crate::ops::{self, Op};
 use crate::tele;
@@ -78,6 +78,10 @@ pub struct TDriveView {
     encrypt_password_input: Entity<InputState>,
     encrypt_confirm_input: Entity<InputState>,
     encrypt_hint_input: Entity<InputState>,
+    /// The name field in the rename dialog.
+    rename_input: Entity<InputState>,
+    /// The name field in the "New folder" dialog.
+    folder_input: Entity<InputState>,
     rows_cache: RefCell<Option<RowsCache>>,
     /// The variable-height list that virtualizes the gallery. It lives on the
     /// view so measurements survive between frames, which is what lets headers
@@ -111,6 +115,8 @@ impl TDriveView {
         let encrypt_hint_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Optional hint (do not put the password here)")
         });
+        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Name"));
+        let folder_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Invoices"));
 
         // Secrets render as dots and stay out of the clipboard, the way the
         // original treats the two-factor password and the passphrase.
@@ -131,6 +137,8 @@ impl TDriveView {
             encrypt_password_input,
             encrypt_confirm_input,
             encrypt_hint_input,
+            rename_input,
+            folder_input,
             rows_cache: RefCell::new(None),
             gallery_list: ListState::new(0, ListAlignment::Top, px(400.)),
             gallery_list_version: u64::MAX,
@@ -195,6 +203,8 @@ impl TDriveView {
                 this.encrypt_hint_input.clone(),
                 LoginAction::SubmitEncryptionSetup,
             ),
+            (this.rename_input.clone(), LoginAction::SubmitRename),
+            (this.folder_input.clone(), LoginAction::SubmitFolder),
         ] {
             let weak = weak.clone();
             let subscription = cx.subscribe(
@@ -413,7 +423,7 @@ fn row_action(
     icon: IconName,
     danger: bool,
     tooltip: &'static str,
-    on_click: impl Fn(&mut App) + 'static,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let base = if danger {
         theme::danger()
@@ -442,9 +452,9 @@ fn row_action(
         })
         // Stop the row beneath from also handling the click: the row's own
         // handler clears any pending delete confirmation.
-        .on_click(move |_, _window, cx| {
+        .on_click(move |_, window, cx| {
             cx.stop_propagation();
-            on_click(cx);
+            on_click(window, cx);
         })
         .child(glyph(
             icon,
@@ -478,6 +488,9 @@ impl Render for TDriveView {
             LoginStep::ChooseDrive => self.render_drive_picker(cx),
             _ => self.render_login(cx).into_any_element(),
         };
+        let rename_dialog = self.render_rename_dialog(cx);
+        let move_dialog = self.render_move_dialog(cx);
+        let folder_dialog = self.render_folder_dialog(cx);
         let vault_prompt = self.render_vault_prompt(cx);
         let encryption_setup = self.render_encryption_setup(cx);
         let upload_options = self.render_upload_options(cx);
@@ -489,6 +502,9 @@ impl Render for TDriveView {
             .bg(theme::canvas())
             .text_color(theme::text_soft())
             .child(content)
+            .children(rename_dialog)
+            .children(move_dialog)
+            .children(folder_dialog)
             .children(vault_prompt)
             .children(encryption_setup)
             .children(upload_options)
@@ -990,6 +1006,338 @@ impl TDriveView {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// The rename dialog, drawn over the shell while it is open.
+    fn render_rename_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let target = self.state.pending_rename.as_ref()?;
+        let is_folder = target.is_folder;
+        let working = target.working;
+        let name = self.rename_input.read(cx).value().to_string();
+        let view = cx.entity();
+        let submit_view = view.clone();
+        let cancel_view = view.clone();
+        let title = if is_folder {
+            "Rename folder"
+        } else {
+            "Rename file"
+        };
+        let subtitle = if is_folder {
+            "Choose a new folder name."
+        } else {
+            "Choose a new file name."
+        };
+        let label = if is_folder {
+            "Folder name"
+        } else {
+            "File name"
+        };
+        Some(modal_scrim(
+            modal_card(390.)
+                .child(modal_title(title))
+                .child(modal_subtitle(subtitle))
+                .child(field(label, text_field(&self.rename_input)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(10.))
+                        .child(
+                            Button::new("rename-confirm")
+                                .primary()
+                                .label("Rename")
+                                .disabled(working || name.trim().is_empty())
+                                .on_click(move |_, _window, cx| {
+                                    commit_rename(submit_view.clone(), cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("rename-cancel")
+                                .ghost()
+                                .label("Cancel")
+                                .disabled(working)
+                                .on_click(move |_, _window, cx| {
+                                    let view = cancel_view.clone();
+                                    view.update(cx, |this, cx| {
+                                        this.state.close_rename();
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                ),
+        ))
+    }
+
+    /// The destination picker, drawn over the shell while a move is being
+    /// decided. It browses the drive's folders from the root, the way the
+    /// original's picker does, and refuses the item's own folder and, for a
+    /// folder, its own subtree.
+    fn render_move_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let target = self.state.pending_move.as_ref()?;
+        let working = target.working;
+        let path = self.state.move_path.clone();
+        let current = path.last()?;
+        let current_id = current.id.clone();
+        let current_name = current.name.clone();
+        let blocked = self.state.move_blocked();
+        let folders = self.state.folders_in(&current_id);
+        let can_move = self.state.move_available() && !working;
+        let at_source = current_id == target.parent;
+        let title = format!("Move \"{}\"", target.name);
+        let view = cx.entity();
+
+        // The trail down to the folder being browsed: the drive's name first,
+        // then one crumb per folder walked into.
+        let mut trail = div().flex().flex_row().items_center().gap(px(6.));
+        for (index, crumb) in path.iter().enumerate() {
+            let last = index + 1 == path.len();
+            let crumb_view = view.clone();
+            let crumb_index = index;
+            let label = div()
+                .text_size(px(theme::TYPE_SM))
+                .text_color(if last {
+                    theme::text()
+                } else {
+                    theme::text_muted()
+                })
+                .child(crumb.name.clone());
+            trail = trail.child(
+                div()
+                    .id(SharedString::from(format!("move-crumb-{index}")))
+                    .when(!last, |el| {
+                        el.cursor_pointer()
+                            .rounded(px(4.))
+                            .px(px(3.))
+                            .hover(|style| style.bg(theme::overlay_2()))
+                            .on_click(move |_, _window, cx| {
+                                let view = crumb_view.clone();
+                                view.update(cx, |this, cx| {
+                                    this.state.move_path.truncate(crumb_index + 1);
+                                    cx.notify();
+                                });
+                            })
+                    })
+                    .child(label),
+            );
+            if !last {
+                trail = trail.child(
+                    div()
+                        .text_size(px(theme::TYPE_SM))
+                        .text_color(theme::text_subtle())
+                        .child("/"),
+                );
+            }
+        }
+
+        let back_view = view.clone();
+        let can_back = path.len() > 1;
+        let back = div()
+            .id("move-back")
+            .w(px(26.))
+            .h(px(26.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(5.))
+            .opacity(if can_back { 1.0 } else { 0.35 })
+            .when(can_back, |el| {
+                el.cursor_pointer()
+                    .hover(|style| style.bg(theme::overlay_2()))
+                    .on_click(move |_, _window, cx| {
+                        let view = back_view.clone();
+                        view.update(cx, |this, cx| {
+                            if this.state.move_path.len() > 1 {
+                                this.state.move_path.pop();
+                            }
+                            cx.notify();
+                        });
+                    })
+            })
+            .child(glyph(
+                IconName::ChevronLeft,
+                14.,
+                if can_back {
+                    theme::text()
+                } else {
+                    theme::text_subtle()
+                },
+            ));
+
+        let mut listing = div().flex().flex_col().gap(px(2.));
+        if folders.is_empty() {
+            listing = listing.child(
+                div()
+                    .py(px(14.))
+                    .text_size(px(theme::TYPE_SM))
+                    .text_color(theme::text_muted())
+                    .child("No folders here."),
+            );
+        }
+        for (id, name) in folders {
+            let folder_blocked_or_here = blocked.contains(&id);
+            let open_view = view.clone();
+            let folder_id = id.clone();
+            let entry = div()
+                .id(SharedString::from(format!("move-to-{id}")))
+                .h(px(34.))
+                .px(px(8.))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .rounded(px(6.))
+                .text_size(px(theme::TYPE_SM))
+                .text_color(if folder_blocked_or_here {
+                    theme::text_subtle()
+                } else {
+                    theme::text_soft()
+                })
+                .when(!folder_blocked_or_here, |el| {
+                    el.cursor_pointer()
+                        .hover(|style| style.bg(theme::overlay_2()))
+                        .on_click(move |_, _window, cx| {
+                            let view = open_view.clone();
+                            let id = folder_id.clone();
+                            view.update(cx, |this, cx| {
+                                let name = this
+                                    .state
+                                    .files
+                                    .iter()
+                                    .find(|file| file.object_id == id)
+                                    .map(|file| file.name.clone())
+                                    .unwrap_or_default();
+                                this.state.move_path.push(Crumb { id, name });
+                                cx.notify();
+                            });
+                        })
+                })
+                .child(glyph(
+                    IconName::Folder,
+                    14.,
+                    if folder_blocked_or_here {
+                        theme::text_subtle()
+                    } else {
+                        theme::text_muted()
+                    },
+                ))
+                .child(div().min_w_0().truncate().child(name));
+            listing = listing.child(entry);
+        }
+
+        let confirm_view = view.clone();
+        let cancel_view = view.clone();
+        Some(modal_scrim(
+            modal_card(420.)
+                .child(modal_title(title))
+                .child(modal_subtitle("Select destination folder"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(back)
+                        .child(trail),
+                )
+                .child(
+                    div()
+                        .id("move-list")
+                        .flex()
+                        .flex_col()
+                        .h(px(230.))
+                        .overflow_y_scroll()
+                        .border_1()
+                        .border_color(theme::border_soft())
+                        .rounded(px(8.))
+                        .p(px(4.))
+                        .child(listing),
+                )
+                .children(at_source.then(|| {
+                    div()
+                        .text_size(px(theme::TYPE_XS))
+                        .text_color(theme::text_muted())
+                        .child("The items are already in this folder.")
+                }))
+                .children(blocked.contains(&current_id).then(|| {
+                    div()
+                        .text_size(px(theme::TYPE_XS))
+                        .text_color(theme::danger())
+                        .child("You can't move a folder into itself.")
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(10.))
+                        .child(
+                            Button::new("move-confirm")
+                                .primary()
+                                .label(format!("Move to \"{current_name}\""))
+                                .disabled(!can_move)
+                                .on_click(move |_, _window, cx| {
+                                    commit_move(confirm_view.clone(), cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("move-cancel")
+                                .ghost()
+                                .label("Cancel")
+                                .disabled(working)
+                                .on_click(move |_, _window, cx| {
+                                    let view = cancel_view.clone();
+                                    view.update(cx, |this, cx| {
+                                        this.state.close_move();
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                ),
+        ))
+    }
+
+    /// The "New folder" dialog.
+    fn render_folder_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.state.pending_folder {
+            return None;
+        }
+        let name = self.folder_input.read(cx).value().to_string();
+        let view = cx.entity();
+        let submit_view = view.clone();
+        let cancel_view = view.clone();
+        Some(modal_scrim(
+            modal_card(390.)
+                .child(modal_title("New folder"))
+                .child(modal_subtitle("Create a folder in the current location."))
+                .child(field("Folder name", text_field(&self.folder_input)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(10.))
+                        .child(
+                            Button::new("folder-create")
+                                .primary()
+                                .label("Create folder")
+                                .disabled(name.trim().is_empty())
+                                .on_click(move |_, _window, cx| {
+                                    commit_folder(submit_view.clone(), cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("folder-cancel")
+                                .ghost()
+                                .label("Cancel")
+                                .on_click(move |_, _window, cx| {
+                                    let view = cancel_view.clone();
+                                    view.update(cx, |this, cx| {
+                                        this.state.pending_folder = false;
+                                        cx.notify();
+                                    });
+                                }),
+                        ),
+                ),
+        ))
     }
 
     /// The first-time encryption setup, drawn over whatever is beneath it.
@@ -1529,6 +1877,7 @@ impl TDriveView {
 
         let upload_view = view.clone();
         let reload_view = view.clone();
+        let new_folder_view = view.clone();
 
         let header = div()
             .h(px(theme::HEADER_H))
@@ -1581,6 +1930,25 @@ impl TDriveView {
                                     }
                                     spawn_load_drive(reload_view.clone(), index, true, cx);
                                 }
+                            })
+                    }))
+                    .children((!trash_mode && !gallery_only).then(|| {
+                        let folder_view = new_folder_view.clone();
+                        Button::new("new-folder")
+                            .ghost()
+                            .icon(IconName::FolderPlus)
+                            .tooltip("New folder")
+                            .on_click(move |_, window, cx| {
+                                let view = folder_view.clone();
+                                view.update(cx, |this, cx| {
+                                    this.state.pending_folder = true;
+                                    cx.notify();
+                                });
+                                let input = view.read(cx).folder_input.clone();
+                                input.update(cx, |state, cx| {
+                                    state.set_value("", window, cx);
+                                    state.focus(window, cx);
+                                });
                             })
                     }))
                     .children((!trash_mode).then(|| {
@@ -1710,7 +2078,7 @@ impl TDriveView {
                         .on_click(move |_, window, cx| {
                             let view = unlock_view.clone();
                             view.update(cx, |this, cx| {
-                                this.state.request_vault(None);
+                                this.state.request_vault_for(VaultResume::Nothing, None);
                                 cx.notify();
                             });
                             focus_unlock_field(&view, window, cx);
@@ -2388,86 +2756,117 @@ impl TDriveView {
             LocalState::Failed(_) => Some(("Failed", theme::danger())),
         };
 
-        let actions = if is_folder {
-            // A folder has nothing to download and nothing to delete from here,
-            // so it keeps the column's width but no buttons.
-            div()
-                .w(px(theme::COL_ACTIONS_W))
-                .flex_shrink_0()
-                .into_any_element()
+        let rename_view = view.clone();
+        let move_view = view.clone();
+        // Folders carry the same rename and move actions as files and one fewer:
+        // a folder has no body to download on its own.
+        let mut buttons: Vec<AnyElement> = Vec::new();
+        if confirming {
+            buttons.push(row_action(
+                SharedString::from(format!("confirm-{index}")),
+                group.clone(),
+                false,
+                IconName::Check,
+                false,
+                "Confirm delete",
+                move |_window, cx| spawn_delete(confirm_view.clone(), index, cx),
+            ));
+            buttons.push(row_action(
+                SharedString::from(format!("cancel-{index}")),
+                group.clone(),
+                false,
+                IconName::X,
+                false,
+                "Cancel",
+                move |_window, cx| {
+                    cancel_view.update(cx, |this, cx| {
+                        this.state.pending_delete = None;
+                        cx.notify();
+                    });
+                },
+            ));
         } else {
-            div()
-                .w(px(theme::COL_ACTIONS_W))
-                .flex_shrink_0()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_end()
-                .gap(px(4.))
-                .children(meta.map(|(text, color)| {
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(theme::TYPE_XS))
-                        .text_color(color)
-                        .child(text)
-                }))
-                .child(if confirming {
-                    row_action(
-                        SharedString::from(format!("confirm-{index}")),
-                        group.clone(),
-                        false,
-                        IconName::Check,
-                        false,
-                        "Confirm delete",
-                        move |cx| spawn_delete(confirm_view.clone(), index, cx),
-                    )
-                } else {
-                    row_action(
-                        SharedString::from(format!("download-{index}")),
-                        group.clone(),
-                        hidden,
-                        IconName::Download,
-                        false,
-                        "Download",
-                        move |cx| spawn_download(download_view.clone(), index, cx),
-                    )
-                })
-                .child(if confirming {
-                    row_action(
-                        SharedString::from(format!("cancel-{index}")),
-                        group.clone(),
-                        false,
-                        IconName::X,
-                        false,
-                        "Cancel",
-                        move |cx| {
-                            cancel_view.update(cx, |this, cx| {
-                                this.state.pending_delete = None;
-                                cx.notify();
-                            });
-                        },
-                    )
-                } else {
-                    row_action(
-                        SharedString::from(format!("delete-{index}")),
-                        group.clone(),
-                        hidden,
-                        IconName::Trash,
-                        true,
-                        "Delete",
-                        move |cx| {
-                            let message_id = ask_delete_view.read(cx).state.files[index].message_id;
-                            ask_delete_view.update(cx, |this, cx| {
-                                this.state.pending_delete = Some(message_id);
-                                this.state.selected_file = Some(index);
-                                cx.notify();
-                            });
-                        },
-                    )
-                })
-                .into_any_element()
-        };
+            if !is_folder {
+                buttons.push(row_action(
+                    SharedString::from(format!("download-{index}")),
+                    group.clone(),
+                    hidden,
+                    IconName::Download,
+                    false,
+                    "Download",
+                    move |_window, cx| spawn_download(download_view.clone(), index, cx),
+                ));
+            }
+            buttons.push(row_action(
+                SharedString::from(format!("rename-{index}")),
+                group.clone(),
+                hidden,
+                IconName::Pencil,
+                false,
+                "Rename",
+                move |window, cx| {
+                    let file = rename_view.read(cx).state.files[index].clone();
+                    rename_view.update(cx, |this, cx| {
+                        this.state.close_move();
+                        this.state.begin_rename(&file);
+                        cx.notify();
+                    });
+                    let input = rename_view.read(cx).rename_input.clone();
+                    seed_name_field(&input, &file.name, window, cx);
+                },
+            ));
+            buttons.push(row_action(
+                SharedString::from(format!("move-{index}")),
+                group.clone(),
+                hidden,
+                IconName::FolderInput,
+                false,
+                "Move to",
+                move |_window, cx| {
+                    let file = move_view.read(cx).state.files[index].clone();
+                    move_view.update(cx, |this, cx| {
+                        this.state.close_rename();
+                        this.state.begin_move(&file);
+                        cx.notify();
+                    });
+                },
+            ));
+            buttons.push(row_action(
+                SharedString::from(format!("delete-{index}")),
+                group.clone(),
+                hidden,
+                IconName::Trash,
+                true,
+                "Delete",
+                move |_window, cx| {
+                    let message_id = ask_delete_view.read(cx).state.files[index].message_id;
+                    ask_delete_view.update(cx, |this, cx| {
+                        this.state.pending_delete = Some(message_id);
+                        this.state.selected_file = Some(index);
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+
+        let actions = div()
+            .w(px(theme::COL_ACTIONS_W))
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_end()
+            .gap(px(4.))
+            .children(meta.map(|(text, color)| {
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(theme::TYPE_XS))
+                    .text_color(color)
+                    .child(text)
+            }))
+            .children(buttons)
+            .into_any_element();
 
         div()
             .id(SharedString::from(format!("row-{index}")))
@@ -2652,7 +3051,7 @@ impl TDriveView {
                     IconName::Check,
                     true,
                     "Delete permanently",
-                    move |cx| purge_trash_entry(purge_view.clone(), index, cx),
+                    move |_window, cx| purge_trash_entry(purge_view.clone(), index, cx),
                 )
             } else {
                 row_action(
@@ -2662,7 +3061,7 @@ impl TDriveView {
                     IconName::Undo2,
                     false,
                     "Restore",
-                    move |cx| restore_trash_entry(restore_view.clone(), index, cx),
+                    move |_window, cx| restore_trash_entry(restore_view.clone(), index, cx),
                 )
             })
             .child(if confirming {
@@ -2673,7 +3072,7 @@ impl TDriveView {
                     IconName::X,
                     false,
                     "Cancel",
-                    move |cx| {
+                    move |_window, cx| {
                         cancel_view.update(cx, |this, cx| {
                             this.state.pending_purge = None;
                             cx.notify();
@@ -2688,7 +3087,7 @@ impl TDriveView {
                     IconName::Trash,
                     true,
                     "Delete permanently",
-                    move |cx| {
+                    move |_window, cx| {
                         ask_purge_view.update(cx, |this, cx| {
                             this.state.pending_purge = Some(index);
                             cx.notify();
@@ -2945,6 +3344,66 @@ fn field(label: &'static str, input: impl IntoElement) -> AnyElement {
         .into_any_element()
 }
 
+/// The dimmed backdrop every dialog sits on, matching the original's
+/// `ModalShell`: one centred card over the shell, with the shell still visible
+/// behind it.
+fn modal_scrim(card: impl IntoElement) -> AnyElement {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::rgba(0x05070dcc))
+        .child(card)
+        .into_any_element()
+}
+
+/// The card inside [`modal_scrim`]: the width, padding and border every dialog
+/// in this port shares.
+fn modal_card(width: f32) -> gpui::Div {
+    div()
+        .w(px(width))
+        .flex()
+        .flex_col()
+        .gap(px(14.))
+        .p(px(24.))
+        .rounded(px(12.))
+        .bg(theme::surface_1())
+        .border_1()
+        .border_color(theme::border_soft())
+}
+
+/// A dialog's title, in the weight the original's `ModalShell` gives it.
+fn modal_title(text: impl Into<SharedString>) -> impl IntoElement {
+    div()
+        .text_size(px(theme::TYPE_MD))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::text())
+        .child(text.into())
+}
+
+/// A dialog's one-line subtitle.
+fn modal_subtitle(text: impl Into<SharedString>) -> impl IntoElement {
+    div()
+        .text_size(px(theme::TYPE_SM))
+        .text_color(theme::text_muted())
+        .child(text.into())
+}
+
+/// Fill a name field that was just put on screen and put the caret in it, so
+/// the name can be replaced without a second click.
+fn seed_name_field(input: &Entity<InputState>, name: &str, window: &mut Window, cx: &mut App) {
+    let input = input.clone();
+    let name = name.to_string();
+    input.update(cx, |state, cx| {
+        state.set_value(name, window, cx);
+        state.focus(window, cx);
+    });
+}
+
 #[derive(Clone, Copy)]
 enum LoginAction {
     Connect,
@@ -2956,6 +3415,10 @@ enum LoginAction {
     UnlockVault,
     /// Create the drive's encryption config from the setup form.
     SubmitEncryptionSetup,
+    /// Take the name in the rename dialog.
+    SubmitRename,
+    /// Create the folder named in the "New folder" dialog.
+    SubmitFolder,
 }
 
 fn login_button(
@@ -2980,6 +3443,8 @@ fn run_login_action(view: Entity<TDriveView>, action: LoginAction, cx: &mut App)
         LoginAction::Unlock => unlock_two_factor(view, cx),
         LoginAction::UnlockVault => submit_vault_password(view, cx),
         LoginAction::SubmitEncryptionSetup => submit_encryption_setup(view, cx),
+        LoginAction::SubmitRename => commit_rename(view, cx),
+        LoginAction::SubmitFolder => commit_folder(view, cx),
     }
 }
 
@@ -3671,6 +4136,9 @@ fn spawn_write_keeping_key(
         this.state.pending_delete = None;
         this.state.pending_purge = None;
         this.state.confirm_empty_trash = false;
+        this.state.close_rename();
+        this.state.close_move();
+        this.state.pending_folder = false;
         this.state.files_loading = true;
         this.state.status = "Saving...".to_string();
         this.state.error = None;
@@ -3817,7 +4285,8 @@ fn spawn_download(view: Entity<TDriveView>, index: usize, cx: &mut App) {
     // first; a successful unlock resumes this download by itself.
     if encrypted && key.is_none() {
         view.update(cx, |this, cx| {
-            this.state.request_vault(Some(message_id));
+            this.state
+                .request_vault_for(VaultResume::Open, Some(message_id));
             this.state.status = format!("{name} is encrypted");
             cx.notify();
         });
@@ -3968,7 +4437,7 @@ fn advance_upload(view: Entity<TDriveView>, cx: &mut App) {
     if pending.encrypt && key.is_none() {
         view.update(cx, |this, cx| {
             if has_config {
-                this.state.request_vault(None);
+                this.state.request_vault_for(VaultResume::Upload, None);
                 this.state.status = "Enter your encryption password".to_string();
             } else {
                 this.state.open_encryption_setup();
@@ -4151,28 +4620,49 @@ fn submit_vault_password(view: Entity<TDriveView>, cx: &mut App) {
             })
         });
 
-        // Unlocking resumes whatever asked for the key: a download of a row, or
-        // an upload whose encryption was waiting on it. A download's row is
-        // found by message id so this stays correct even if the list moved
-        // underneath it.
+        // Unlocking resumes whatever asked for the key: a download of a row, an
+        // upload whose encryption was waiting on it, or a rename or a move the
+        // drive refused while the file was locked. A download's row is found by
+        // message id so this stays correct even if the list moved underneath it.
         if let Some(prompt) = resume {
-            if prompt.message_id.is_none() {
-                // No row asked for the key, so it was an upload: continue it.
-                cx.update(|cx| advance_upload(view, cx));
-                return;
-            }
-            if let Some(message_id) = prompt.message_id {
-                cx.update(|cx| {
-                    let index = view
-                        .read(cx)
-                        .state
-                        .files
-                        .iter()
-                        .position(|file| file.message_id == message_id);
-                    if let Some(index) = index {
-                        spawn_download(view, index, cx);
+            match prompt.resume {
+                VaultResume::Upload => cx.update(|cx| advance_upload(view, cx)),
+                VaultResume::Rename => cx.update(|cx| {
+                    let view = view.clone();
+                    view.update(cx, |this, cx| {
+                        if let Some(pending) = this.state.pending_rename.as_mut() {
+                            pending.working = false;
+                        }
+                        cx.notify();
+                    });
+                    commit_rename(view, cx);
+                }),
+                VaultResume::Move => cx.update(|cx| {
+                    let view = view.clone();
+                    view.update(cx, |this, cx| {
+                        if let Some(pending) = this.state.pending_move.as_mut() {
+                            pending.working = false;
+                        }
+                        cx.notify();
+                    });
+                    commit_move(view, cx);
+                }),
+                VaultResume::Nothing => {}
+                VaultResume::Open => {
+                    if let Some(message_id) = prompt.message_id {
+                        cx.update(|cx| {
+                            let index = view
+                                .read(cx)
+                                .state
+                                .files
+                                .iter()
+                                .position(|file| file.message_id == message_id);
+                            if let Some(index) = index {
+                                spawn_download(view, index, cx);
+                            }
+                        });
                     }
-                });
+                }
             }
         }
     })
@@ -4335,6 +4825,186 @@ fn spawn_delete(view: Entity<TDriveView>, index: usize, cx: &mut App) {
         format!("Moved {name} to trash"),
         cx,
     );
+}
+
+/// Take the name in the rename dialog.
+///
+/// The drive refuses to rename an encrypted file while its key is missing, so
+/// a locked row asks for the passphrase first and comes back here once it is
+/// known. A name that is empty never gets this far: the button that calls it is
+/// dimmed.
+fn commit_rename(view: Entity<TDriveView>, cx: &mut App) {
+    let (target, name, demo, key, has_client) = {
+        let this = view.read(cx);
+        let Some(target) = this.state.pending_rename.clone() else {
+            return;
+        };
+        if target.working {
+            return;
+        }
+        (
+            target,
+            this.rename_input.read(cx).value().trim().to_string(),
+            this.state.demo,
+            this.state.vault.as_ref().and_then(|vault| vault.key),
+            this.state.tele.is_some(),
+        )
+    };
+    if name.is_empty() {
+        return;
+    }
+
+    let encrypted = view
+        .read(cx)
+        .state
+        .files
+        .iter()
+        .any(|file| file.message_id == target.message_id && file.encrypted);
+    if encrypted && key.is_none() {
+        view.update(cx, |this, cx| {
+            this.state
+                .request_vault_for(VaultResume::Rename, Some(target.message_id));
+            if let Some(pending) = this.state.pending_rename.as_mut() {
+                pending.working = true;
+            }
+            cx.notify();
+        });
+        return;
+    }
+
+    // Without a session there is nothing to write to, but the demo still walks
+    // the local half of the flow.
+    if !has_client {
+        if demo {
+            view.update(cx, |this, cx| {
+                this.state.rename_local(&target.object_id, &name);
+                this.state.pending_rename = None;
+                this.state.status = format!("Renamed to {name}");
+                cx.notify();
+            });
+        }
+        return;
+    }
+
+    view.update(cx, |this, cx| {
+        if let Some(pending) = this.state.pending_rename.as_mut() {
+            pending.working = true;
+        }
+        cx.notify();
+    });
+    let op = ops::rename_op(&target.object_id, &name);
+    spawn_write(view, vec![op], Vec::new(), format!("Renamed to {name}"), cx);
+}
+
+/// Take the destination the move dialog is pointing at.
+fn commit_move(view: Entity<TDriveView>, cx: &mut App) {
+    let (target, destination, destination_name, demo, key, has_client) = {
+        let this = view.read(cx);
+        let Some(target) = this.state.pending_move.clone() else {
+            return;
+        };
+        if target.working || !this.state.move_available() {
+            return;
+        }
+        let (destination, destination_name) = this
+            .state
+            .move_path
+            .last()
+            .map(|crumb| (crumb.id.clone(), crumb.name.clone()))
+            .unwrap_or_default();
+        (
+            target,
+            destination,
+            destination_name,
+            this.state.demo,
+            this.state.vault.as_ref().and_then(|vault| vault.key),
+            this.state.tele.is_some(),
+        )
+    };
+
+    let encrypted = view
+        .read(cx)
+        .state
+        .files
+        .iter()
+        .any(|file| file.message_id == target.message_id && file.encrypted);
+    if encrypted && key.is_none() {
+        view.update(cx, |this, cx| {
+            this.state
+                .request_vault_for(VaultResume::Move, Some(target.message_id));
+            if let Some(pending) = this.state.pending_move.as_mut() {
+                pending.working = true;
+            }
+            cx.notify();
+        });
+        return;
+    }
+
+    if !has_client {
+        if demo {
+            view.update(cx, |this, cx| {
+                this.state.move_local(&target.object_id, &destination);
+                this.state.close_move();
+                this.state.status = format!("Moved {} to {destination_name}", target.name);
+                cx.notify();
+            });
+        }
+        return;
+    }
+
+    view.update(cx, |this, cx| {
+        if let Some(pending) = this.state.pending_move.as_mut() {
+            pending.working = true;
+        }
+        cx.notify();
+    });
+    let op = ops::move_op(&target.object_id, &destination);
+    spawn_write(
+        view,
+        vec![op],
+        Vec::new(),
+        format!("Moved {} to {destination_name}", target.name),
+        cx,
+    );
+}
+
+/// Create the folder named in the "New folder" dialog.
+///
+/// The object id is chosen here rather than taken from the message the
+/// operation travels in, which is the original's `d:<uuid>`: it stays the
+/// folder's identity for the whole life of the drive.
+fn commit_folder(view: Entity<TDriveView>, cx: &mut App) {
+    let (name, parent, demo, has_client) = {
+        let this = view.read(cx);
+        if !this.state.pending_folder {
+            return;
+        }
+        (
+            this.folder_input.read(cx).value().trim().to_string(),
+            this.state.current_folder().to_string(),
+            this.state.demo,
+            this.state.tele.is_some(),
+        )
+    };
+    if name.is_empty() {
+        return;
+    }
+
+    if !has_client {
+        if demo {
+            view.update(cx, |this, cx| {
+                this.state.mkdir_local(&parent, &name);
+                this.state.pending_folder = false;
+                this.state.status = format!("Created {name}");
+                cx.notify();
+            });
+        }
+        return;
+    }
+
+    let object_id = ops::new_folder_id();
+    let op = ops::mkdir_op(&object_id, &parent, &name);
+    spawn_write(view, vec![op], Vec::new(), format!("Created {name}"), cx);
 }
 
 /// Put a trashed item back in the drive it came from.

@@ -277,7 +277,7 @@ pub const TILE: f32 = 32.0;
 pub const ACTION: f32 = 28.0;
 pub const COL_DATE_W: f32 = 150.0;
 pub const COL_SIZE_W: f32 = 120.0;
-pub const COL_ACTIONS_W: f32 = 100.0;
+pub const COL_ACTIONS_W: f32 = 140.0;
 /// The 12px `column-gap` between the table's cells.
 pub const COL_GAP: f32 = 12.0;
 /// The 20px `--space-5` a row pads itself with.

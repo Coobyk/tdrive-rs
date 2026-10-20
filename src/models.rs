@@ -379,6 +379,55 @@ pub struct Vault {
 pub struct VaultPrompt {
     /// The encrypted row that asked for the key, when a file was being opened.
     pub message_id: Option<i32>,
+    /// What to pick up again once the key is known. The drive refuses to
+    /// rename, move or open an encrypted row without it, so the action that hit
+    /// the refusal is remembered here rather than being lost with the prompt.
+    pub resume: VaultResume,
+}
+
+/// The action a prompt is standing in for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VaultResume {
+    /// Nothing in particular: the user asked to unlock on its own.
+    #[default]
+    Nothing,
+    /// An upload that was waiting to encrypt.
+    Upload,
+    /// A row that was being opened or downloaded.
+    Open,
+    /// A rename the drive will not take while the file is locked.
+    Rename,
+    /// A move, for the same reason.
+    Move,
+}
+
+/// The row a rename dialog is renaming, while it is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameTarget {
+    /// The drive's own object id, which the operation names.
+    pub object_id: String,
+    /// The message the row was read from, so it can be found again after a
+    /// prompt has been answered.
+    pub message_id: i32,
+    /// The name it carries now; the field starts on it.
+    pub name: String,
+    /// Folders and files are renamed by the same operation but titled apart.
+    pub is_folder: bool,
+    /// Set once the name has been submitted, so the dialog stops taking input
+    /// while the drive and, when it asks for one, the password prompt work.
+    pub working: bool,
+}
+
+/// The row a move dialog is moving, while it is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveTarget {
+    pub object_id: String,
+    pub message_id: i32,
+    pub name: String,
+    /// The folder it sits in now, which is not offered as a destination.
+    pub parent: String,
+    pub is_folder: bool,
+    pub working: bool,
 }
 
 /// The "How would you like to upload?" choice, while it is on screen.
@@ -513,6 +562,14 @@ pub struct AppState {
     pub encryption_setup: Option<EncryptionSetup>,
     /// The upload options modal, while it is open.
     pub upload_options: Option<UploadOptions>,
+    /// The row asking for a new name, while the rename dialog is open.
+    pub pending_rename: Option<RenameTarget>,
+    /// The row asking for a new home, while the move dialog is open.
+    pub pending_move: Option<MoveTarget>,
+    /// The folders the move dialog has walked into, the drive root first.
+    pub move_path: Vec<Crumb>,
+    /// Whether the "New folder" dialog is open.
+    pub pending_folder: bool,
     /// The file a modal or a password prompt is standing in for.
     pub pending_upload: Option<PendingUpload>,
     /// True when the shell is running on [`AppState::seed_demo`] data rather
@@ -566,6 +623,10 @@ impl Default for AppState {
             vault: None,
             encryption_setup: None,
             upload_options: None,
+            pending_rename: None,
+            pending_move: None,
+            move_path: Vec::new(),
+            pending_folder: false,
             pending_upload: None,
             demo: false,
             trash: Vec::new(),
@@ -703,13 +764,159 @@ impl AppState {
         }
     }
 
-    /// Raise the unlock prompt, optionally remembering which row asked for it
-    /// so the action can resume once the key is known.
-    pub fn request_vault(&mut self, message_id: Option<i32>) {
+    /// Raise the unlock prompt, naming the action that was refused so it can be
+    /// picked up again once the key is known.
+    pub fn request_vault_for(&mut self, resume: VaultResume, message_id: Option<i32>) {
         if let Some(vault) = self.vault.as_mut() {
-            vault.prompt = Some(VaultPrompt { message_id });
+            vault.prompt = Some(VaultPrompt { message_id, resume });
             vault.error = None;
         }
+    }
+
+    /// Open the rename dialog on a live row.
+    pub fn begin_rename(&mut self, file: &RemoteFile) {
+        self.pending_rename = Some(RenameTarget {
+            object_id: file.object_id.clone(),
+            message_id: file.message_id,
+            name: file.name.clone(),
+            is_folder: file.is_folder(),
+            working: false,
+        });
+    }
+
+    pub fn close_rename(&mut self) {
+        self.pending_rename = None;
+    }
+
+    /// Open the move dialog on a live row, listing the drive from its root the
+    /// way the original's picker starts there.
+    pub fn begin_move(&mut self, file: &RemoteFile) {
+        let root = self
+            .active_dialog()
+            .map(|drive| drive.title.clone())
+            .unwrap_or_else(|| "My Drive".to_string());
+        self.move_path = vec![Crumb::root(&root)];
+        self.pending_move = Some(MoveTarget {
+            object_id: file.object_id.clone(),
+            message_id: file.message_id,
+            name: file.name.clone(),
+            parent: file.parent.clone(),
+            is_folder: file.is_folder(),
+            working: false,
+        });
+    }
+
+    pub fn close_move(&mut self) {
+        self.pending_move = None;
+        self.move_path.clear();
+    }
+
+    /// The folder the move dialog is looking at: `""` for the drive root.
+    pub fn move_current(&self) -> &str {
+        self.move_path
+            .last()
+            .map(|crumb| crumb.id.as_str())
+            .unwrap_or("")
+    }
+
+    /// The folders directly under a folder, which is all the move dialog
+    /// offers: a file cannot be parked in a file, and the drive's own listing
+    /// is already in memory.
+    pub fn folders_in(&self, parent: &str) -> Vec<(String, String)> {
+        let mut folders: Vec<(String, String)> = self
+            .files
+            .iter()
+            .filter(|file| file.is_folder() && file.parent == parent)
+            .map(|file| (file.object_id.clone(), file.name.clone()))
+            .collect();
+        folders.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        folders
+    }
+
+    /// The destinations a move must refuse: the moving folder itself and
+    /// everything beneath it, which is the original's `computeBlocked`.
+    pub fn move_blocked(&self) -> BTreeSet<String> {
+        let mut blocked = BTreeSet::new();
+        let Some(target) = self.pending_move.as_ref() else {
+            return blocked;
+        };
+        if !target.is_folder {
+            return blocked;
+        }
+        blocked.insert(target.object_id.clone());
+        // A child of a blocked folder is blocked as well, so the walk repeats
+        // until the set stops growing rather than trusting the rows' order.
+        loop {
+            let mut grew = false;
+            for file in &self.files {
+                if file.is_folder()
+                    && blocked.contains(&file.parent)
+                    && !blocked.contains(&file.object_id)
+                {
+                    blocked.insert(file.object_id.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        blocked
+    }
+
+    /// Whether the move dialog can land where it is looking.
+    pub fn move_available(&self) -> bool {
+        let Some(target) = self.pending_move.as_ref() else {
+            return false;
+        };
+        let destination = self.move_current();
+        destination != target.parent && !self.move_blocked().contains(destination)
+    }
+
+    /// Rename a live row in place, which is what the demo walks without a
+    /// session to send the operation to.
+    pub fn rename_local(&mut self, object_id: &str, name: &str) {
+        if let Some(file) = self
+            .files
+            .iter_mut()
+            .find(|file| file.object_id == object_id)
+        {
+            file.name = name.to_string();
+        }
+        self.touch();
+    }
+
+    /// Reparent a live row in place, for the same reason.
+    pub fn move_local(&mut self, object_id: &str, parent: &str) {
+        if let Some(file) = self
+            .files
+            .iter_mut()
+            .find(|file| file.object_id == object_id)
+        {
+            file.parent = parent.to_string();
+        }
+        self.touch();
+    }
+
+    /// Add a folder in place, for the same reason. Returns its object id.
+    pub fn mkdir_local(&mut self, parent: &str, name: &str) -> String {
+        let object_id = crate::ops::new_folder_id();
+        self.files.push(RemoteFile {
+            message_id: 0,
+            object_id: object_id.clone(),
+            name: name.to_string(),
+            size: 0,
+            kind: FileKind::Folder,
+            date: Some(Utc::now()),
+            local_state: LocalState::Remote,
+            parent: parent.to_string(),
+            encrypted: false,
+            plaintext_size: None,
+            content: ContentRef::default(),
+            revision: 1,
+        });
+        self.touch();
+        object_id
     }
 
     /// Take a chosen file to the upload options modal.
@@ -790,14 +997,21 @@ impl AppState {
     /// Dismiss the passphrase prompt, and with it any upload that was waiting
     /// for the key: cancelling the prompt is how the user says no to it.
     pub fn cancel_vault_prompt(&mut self) {
-        let was_upload = self
+        let resume = self
             .vault
             .as_ref()
             .and_then(|vault| vault.prompt.as_ref())
-            .is_some_and(|prompt| prompt.message_id.is_none());
+            .map(|prompt| prompt.resume)
+            .unwrap_or_default();
         self.close_vault_prompt();
-        if was_upload {
-            self.pending_upload = None;
+        // Cancelling cancels what asked for the key, not only the prompt: an
+        // upload that was waiting to encrypt is dropped, and a rename or a move
+        // is abandoned rather than left open behind a dialog nobody dismissed.
+        match resume {
+            VaultResume::Upload => self.pending_upload = None,
+            VaultResume::Rename => self.pending_rename = None,
+            VaultResume::Move => self.close_move(),
+            VaultResume::Nothing | VaultResume::Open => {}
         }
     }
 
@@ -1330,17 +1544,34 @@ mod tests {
             path: PathBuf::from("/tmp/report.pdf"),
             encrypt: true,
         });
-        state.request_vault(None);
+        state.request_vault_for(VaultResume::Upload, None);
         state.cancel_vault_prompt();
         assert!(state.pending_upload.is_none());
 
+        // A prompt a row asked for is not the upload's: cancelling it must
+        // leave the batch waiting rather than dropping it.
         state.pending_upload = Some(PendingUpload {
             path: PathBuf::from("/tmp/report.pdf"),
             encrypt: true,
         });
-        state.request_vault(Some(42));
+        state.request_vault_for(VaultResume::Open, Some(42));
         state.cancel_vault_prompt();
         assert!(state.pending_upload.is_some());
+
+        // Cancelling a refused rename or move abandons the dialog that asked,
+        // so nothing is left open behind a prompt nobody answered.
+        state.pending_upload = None;
+        state.files.push(file(42, "locked.png", 10, ""));
+        let row = state.files[0].clone();
+        state.begin_rename(&row);
+        state.request_vault_for(VaultResume::Rename, Some(42));
+        state.cancel_vault_prompt();
+        assert!(state.pending_rename.is_none());
+
+        state.begin_move(&row);
+        state.request_vault_for(VaultResume::Move, Some(42));
+        state.cancel_vault_prompt();
+        assert!(state.pending_move.is_none());
     }
 
     fn file(message_id: i32, name: &str, size: i64, parent: &str) -> RemoteFile {
@@ -1366,6 +1597,97 @@ mod tests {
             kind: FileKind::Folder,
             ..file(message_id, name, 0, parent)
         }
+    }
+
+    /// The move picker lists folders only, and only those directly beneath the
+    /// folder it is looking at.
+    #[test]
+    fn the_move_picker_lists_the_folders_under_one_parent() {
+        let state = AppState {
+            files: vec![
+                folder(1, "b", ""),
+                folder(2, "a", ""),
+                file(3, "note.txt", 1, ""),
+                folder(4, "inside", "d:1"),
+            ],
+            ..AppState::default()
+        };
+        assert_eq!(
+            state.folders_in(""),
+            vec![
+                ("d:2".to_string(), "a".to_string()),
+                ("d:1".to_string(), "b".to_string()),
+            ]
+        );
+        assert_eq!(
+            state.folders_in("d:1"),
+            vec![("d:4".to_string(), "inside".to_string())]
+        );
+    }
+
+    /// A folder cannot be dropped inside itself or inside its own subtree; a
+    /// file, having no subtree, can go anywhere else.
+    #[test]
+    fn a_folder_blocks_its_own_subtree_as_a_destination() {
+        let mut state = AppState {
+            files: vec![
+                folder(1, "top", ""),
+                folder(2, "middle", "d:1"),
+                folder(3, "bottom", "d:2"),
+                folder(4, "elsewhere", ""),
+                file(5, "note.txt", 1, "d:3"),
+            ],
+            ..AppState::default()
+        };
+
+        let moving = state.files[0].clone();
+        state.begin_move(&moving);
+        let blocked = state.move_blocked();
+        assert!(blocked.contains("d:1") && blocked.contains("d:2") && blocked.contains("d:3"));
+        assert!(!blocked.contains("d:4"));
+
+        // The drive root is the folder's current home, so it is refused for a
+        // different reason: the items are already there.
+        assert!(!state.move_available());
+        state.move_path.push(Crumb {
+            id: "d:4".to_string(),
+            name: "elsewhere".to_string(),
+        });
+        assert!(state.move_available());
+
+        // A file has no subtree, so every folder but its own home is open.
+        state.close_move();
+        let file_row = state.files[4].clone();
+        state.begin_move(&file_row);
+        assert!(state.move_blocked().is_empty());
+        assert!(state.move_available(), "the root is not where the file is");
+    }
+
+    /// The local halves of the three writes, which is what the demo walks
+    /// without a session to send the operations to.
+    #[test]
+    fn the_demo_applies_a_rename_a_move_and_a_new_folder() {
+        let mut state = AppState {
+            files: vec![folder(1, "docs", ""), file(2, "note.txt", 1, "")],
+            ..AppState::default()
+        };
+
+        state.rename_local("f:2", "renamed.txt");
+        assert_eq!(state.files[1].name, "renamed.txt");
+
+        state.move_local("f:2", "d:1");
+        assert_eq!(state.files[1].parent, "d:1");
+
+        let made = state.mkdir_local("d:1", "nested");
+        assert!(made.starts_with("d:"));
+        let added = state
+            .files
+            .iter()
+            .find(|row| row.object_id == made)
+            .expect("the folder was added");
+        assert!(added.is_folder());
+        assert_eq!(added.parent, "d:1");
+        assert_eq!(added.name, "nested");
     }
 
     /// The footer reports what the drive stores, which the original computes by
@@ -1706,7 +2028,7 @@ mod tests {
         let mut state = AppState::default();
         state.set_vault(Some((material, "hint".to_string())));
 
-        state.request_vault(Some(77));
+        state.request_vault_for(VaultResume::Open, Some(77));
         let prompt = state
             .vault
             .as_ref()
