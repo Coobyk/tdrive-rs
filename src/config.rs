@@ -9,6 +9,7 @@
 //! `ErrConfigInvalid`: the drive picker appears rather than an error.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -25,9 +26,25 @@ pub const DEFAULT_CHANNEL_ABOUT: &str = "TDrive personal storage";
 /// setup screen remembers in `imp_config.json` — instead of asking for them
 /// again.
 pub fn data_dir() -> PathBuf {
+    if let Some(dir) = DATA_DIR.get() {
+        return dir.clone();
+    }
     directories::BaseDirs::new()
         .map(|dirs| dirs.config_dir().join("TDrive"))
         .unwrap_or_else(|| PathBuf::from("TDrive"))
+}
+
+/// Where the port keeps its files, when the application says.
+///
+/// The desktop uses the platform's own place, which the original shares. A
+/// phone has one place it may write to and no platform place of its own, so
+/// the application says which; without this the path would be relative, and
+/// a relative path is a path the phone cannot open.
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Point the port's files at a directory of the application's choosing.
+pub fn set_data_dir(path: impl Into<PathBuf>) {
+    let _ = DATA_DIR.set(path.into());
 }
 
 /// The authorization the original application already holds.
@@ -96,7 +113,7 @@ fn decode_key(encoded: &str) -> Option<Vec<u8>> {
 }
 
 /// Create the data directory with the original's private mode.
-fn ensure_data_dir() -> Result<(), String> {
+pub fn ensure_data_dir() -> Result<(), String> {
     let path = data_dir();
     std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
     restrict(&path, 0o700);
