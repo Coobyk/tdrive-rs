@@ -25,21 +25,21 @@ use gpui_component::{
 };
 use gpui_kit_assets::IconName;
 
-use crate::cache;
-use crate::config::{
+use tdrive_rs::cache;
+use tdrive_rs::config::{
     self, DEFAULT_CHANNEL_ABOUT, DEFAULT_CHANNEL_TITLE, DriveConfig, StoredDrive, ThemePreference,
 };
-use crate::crypto::{self, VaultMaterial};
-use crate::format::{entry_origin, human_size, purge_countdown, short_date};
-use crate::models::{
+use tdrive_rs::crypto::{self, VaultMaterial};
+use tdrive_rs::format::{entry_origin, human_size, purge_countdown, short_date};
+use tdrive_rs::models::{
     AppState, ContentRef, Crumb, DerivativeJob, Drive, DriveCandidate, DriveKind, FileKind,
     LocalState, LoginStep, PURGE_WINDOW_DAYS, Preview, PreviewKind, RemoteFile, SortKey, SortState,
     TrashEntry, VaultResume, ViewMode, preview_kind,
 };
-use crate::ops::{self, Op};
-use crate::rendition;
-use crate::tele;
-use crate::tele::DriveContents;
+use tdrive_rs::ops::{self, Op};
+use tdrive_rs::rendition;
+use tdrive_rs::tele;
+use tdrive_rs::tele::DriveContents;
 use crate::theme;
 
 type TeleClient = grammers_client::Client;
@@ -4365,7 +4365,7 @@ fn connect_telegram(view: Entity<TDriveView>, cx: &mut App) {
         return;
     }
 
-    let creds = crate::models::Credentials { api_id, api_hash };
+    let creds = tdrive_rs::models::Credentials { api_id, api_hash };
     view.update(cx, |this, cx| {
         this.state.creds = Some(creds.clone());
         this.state.login.error = None;
@@ -6176,7 +6176,7 @@ fn commit_move(view: Entity<TDriveView>, cx: &mut App) {
 
 /// How a batch of rows is named in a message: the name of the one row, or the
 /// count of the many, the way the original names them.
-fn describe(items: &[crate::models::MoveItem]) -> String {
+fn describe(items: &[tdrive_rs::models::MoveItem]) -> String {
     match items {
         [one] => one.name.clone(),
         many => format!("{} items", many.len()),

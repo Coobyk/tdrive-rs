@@ -281,7 +281,7 @@ struct OpMessage {
 
 /// One part of a multipart group, as the replay saw it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PartMessage {
+pub struct PartMessage {
     index: u32,
     message_id: i32,
     kind: Option<FileKind>,
@@ -290,7 +290,7 @@ pub(crate) struct PartMessage {
 
 /// A derivative published beside a file, as the replay saw it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct RenditionMessage {
+pub struct RenditionMessage {
     /// The message holding the derivative's bytes.
     message_id: i32,
     /// The descriptor that binds it to its file.
@@ -300,7 +300,7 @@ pub(crate) struct RenditionMessage {
 /// The objects one trash op took down: the object it named plus the descendants
 /// that were live at the time.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct TrashGroup {
+pub struct TrashGroup {
     deleted_at: i64,
     /// The named object first, then its descendants.
     members: Vec<RemoteFile>,
@@ -412,7 +412,7 @@ fn row_from_op(
 /// This is what a snapshot stores, so a launch can start from where the last
 /// one stopped instead of reading the whole history again.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ReplayState {
+pub struct ReplayState {
     /// Live objects, by object id.
     pub objects: BTreeMap<String, RemoteFile>,
     /// Trash groups, keyed by the object the trash op named.
@@ -1284,7 +1284,7 @@ pub fn enc_config_op(material: &VaultMaterial, hint: &str) -> Op {
 /// from the client that started the purge. A legacy upload keeps its bytes in
 /// its own operation message, which is the drive's record that the object
 /// existed, so that one is left alone -- the plan leaves it alone too.
-pub(crate) fn purged_bodies(state: &ReplayState, roots: &[String]) -> Vec<i32> {
+pub fn purged_bodies(state: &ReplayState, roots: &[String]) -> Vec<i32> {
     let mut bodies = BTreeSet::new();
     for root in roots {
         let Some(group) = state.trashed.get(root) else {

@@ -8,7 +8,57 @@
 //! A colour is `0xRRGGBB` unless it is one the original keeps translucent, in
 //! which case it is `0xRRGGBBAA` and the alpha is the last byte.
 
-use crate::theme::Palette;
+/// One palette's worth of semantic colours. Values are `0xRRGGBB` unless the
+/// field is an overlay, which is `0xRRGGBBAA`.
+pub struct Palette {
+    pub canvas: u32,
+    pub surface_0: u32,
+    pub surface_1: u32,
+    pub surface_2: u32,
+    pub surface_3: u32,
+
+    pub text: u32,
+    pub text_soft: u32,
+    pub text_muted: u32,
+    pub text_subtle: u32,
+
+    pub border: u32,
+    pub border_soft: u32,
+
+    pub accent: u32,
+    pub accent_hover: u32,
+    pub accent_strong: u32,
+    pub on_accent: u32,
+    pub danger: u32,
+    pub on_danger: u32,
+    pub warning: u32,
+    pub success: u32,
+
+    // Translucent overlays. Alpha is the last byte.
+    pub overlay_neutral_1: u32,
+    pub overlay_neutral_2: u32,
+    pub overlay_neutral_3: u32,
+    pub overlay_white_1: u32,
+    pub overlay_white_2: u32,
+    pub overlay_white_3: u32,
+    pub overlay_accent_1: u32,
+    pub overlay_accent_2: u32,
+    pub overlay_accent_3: u32,
+    pub overlay_danger_1: u32,
+    pub overlay_danger_2: u32,
+    pub overlay_success_1: u32,
+    pub overlay_success_2: u32,
+    pub overlay_warning_1: u32,
+    pub overlay_warning_2: u32,
+
+    // The glass the original's menus and popovers are made of, and the scrim
+    // that dims the shell behind a modal.
+    pub glass_bg: u32,
+    pub glass_border: u32,
+    pub glass_highlight: u32,
+    pub scrim: u32,
+}
+
 
 /// Daybreak
 pub const DAYBREAK: Palette = Palette {

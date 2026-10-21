@@ -1,19 +1,11 @@
-mod cache;
-mod config;
-mod crypto;
 mod db;
-mod format;
-mod models;
-mod ops;
-mod palettes;
-mod rendition;
-mod tele;
 mod theme;
 mod ui;
 
 use gpui::{App, AppContext};
 use gpui_component::Root;
 use gpui_platform::application;
+use tdrive_rs::themes;
 use ui::TDriveView;
 
 fn main() {
@@ -22,6 +14,12 @@ fn main() {
         .run(|cx: &mut App| {
             gpui_component::init(cx);
             gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+            // The theme the user last chose is the one on screen, and the
+            // catalogue is shared with the phone app.
+            let preference = tdrive_rs::config::DriveConfig::load()
+                .map(|config| config.theme)
+                .unwrap_or_default();
+            themes::set_theme(preference.active());
             let bounds =
                 gpui::Bounds::centered(None, gpui::size(gpui::px(1360.0), gpui::px(860.0)), cx);
             cx.open_window(
