@@ -59,7 +59,6 @@ pub struct Palette {
     pub scrim: u32,
 }
 
-
 /// Daybreak
 pub const DAYBREAK: Palette = Palette {
     canvas: 0xeef4f5,

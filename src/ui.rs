@@ -25,6 +25,7 @@ use gpui_component::{
 };
 use gpui_kit_assets::IconName;
 
+use crate::theme;
 use tdrive_rs::cache;
 use tdrive_rs::config::{
     self, DEFAULT_CHANNEL_ABOUT, DEFAULT_CHANNEL_TITLE, DriveConfig, StoredDrive, ThemePreference,
@@ -40,7 +41,6 @@ use tdrive_rs::ops::{self, Op};
 use tdrive_rs::rendition;
 use tdrive_rs::tele;
 use tdrive_rs::tele::DriveContents;
-use crate::theme;
 
 type TeleClient = grammers_client::Client;
 
@@ -2092,16 +2092,12 @@ impl TDriveView {
                             .on_click(move |_, _window, cx| {
                                 if let Some(index) = reload_view.read(cx).state.active_drive {
                                     // A reload is the way back to the truth the
-                                    // drive itself holds: drop the snapshot so
-                                    // the whole history is read again, and
-                                    // deletions made elsewhere show up. It keeps
-                                    // the folder on screen, as the original's
-                                    // reload does.
-                                    if let Some(drive) =
-                                        reload_view.read(cx).state.drives.get(index)
-                                    {
-                                        cache::invalidate(drive.id);
-                                    }
+                                    // drive itself holds: the messages that
+                                    // arrived since the last read are read
+                                    // again, which is what the original's
+                                    // reload does and what keeps a reload
+                                    // quick. It keeps the folder on screen,
+                                    // as the original's does.
                                     spawn_load_drive(reload_view.clone(), index, true, cx);
                                 }
                             })
@@ -2922,6 +2918,9 @@ impl TDriveView {
         let trash_mode = self.state.trash_mode();
 
         if loading {
+            // A large drive is read in one go the first time, so the read says
+            // where it is rather than leaving the reader to guess.
+            let progress = self.state.load_progress.unwrap_or_default();
             return div()
                 .id("file-list")
                 .flex_1()
@@ -2935,7 +2934,7 @@ impl TDriveView {
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(4.))
+                        .gap(px(8.))
                         .child(
                             div()
                                 .text_size(px(theme::TYPE_MD))
@@ -2943,13 +2942,27 @@ impl TDriveView {
                                 .text_color(theme::text())
                                 .child("Loading files..."),
                         )
+                        .child(progress_bar(self.state.load_sweep))
                         .child(
                             div()
                                 .text_size(px(theme::TYPE_SM))
                                 .text_color(theme::text_muted())
-                                .child(
-                                    "Reading the drive's operations from Telegram.                                      Large drives can take a while the first time.",
-                                ),
+                                .child(match progress.waiting {
+                                    // Telegram has asked the read to wait. It
+                                    // says so rather than looking stuck.
+                                    Some(seconds) => format!(
+                                        "Telegram asked for a {seconds}-second pause; the read continues when it lets us. {} messages read so far.",
+                                        thousands(progress.scanned),
+                                    ),
+                                    None if progress.scanned == 0 => {
+                                        "Reading the drive's operations from Telegram. Large drives can take a while the first time.".to_string()
+                                    }
+                                    None => format!(
+                                        "{} messages read · {} operations · the rest of the app is yours to use.",
+                                        thousands(progress.scanned),
+                                        thousands(progress.operations),
+                                    )
+                                }),
                         ),
                 )
                 .children((0..7).map(skeleton_row))
@@ -4282,6 +4295,45 @@ fn modal_title(text: impl Into<SharedString>) -> impl IntoElement {
         .child(text.into())
 }
 
+/// A bar that shows that something is happening and how far it has got.
+///
+/// The drive's size is not known before it is read, so the bar is a slow
+/// sweep rather than a fraction: it says that the work is real and moving.
+fn progress_bar(sweep: f32) -> impl IntoElement {
+    // The drive's size is not known before it is read, so the bar is a sweep
+    // rather than a fraction: it says the work is real and moving.
+    let position = (sweep * 0.7).clamp(0.0, 0.7);
+    div()
+        .h(px(4.))
+        .w_full()
+        .rounded(px(2.))
+        .overflow_hidden()
+        .bg(theme::surface_3())
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .h_full()
+                .w(px(120.))
+                .left(px(position * 1000.))
+                .rounded(px(2.))
+                .bg(theme::accent()),
+        )
+}
+
+/// A number with the thousands marked out, the way the original writes them.
+fn thousands(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// A dialog's one-line subtitle.
 fn modal_subtitle(text: impl Into<SharedString>) -> impl IntoElement {
     div()
@@ -4931,6 +4983,7 @@ fn spawn_load_drive(view: Entity<TDriveView>, index: usize, refresh: bool, cx: &
         this.state.pending_purge = None;
         this.state.confirm_empty_trash = false;
         this.state.files_loading = true;
+        this.state.load_progress = Some(tele::last_progress());
         this.state.status = if refresh {
             "Reloading...".to_string()
         } else {
@@ -4952,24 +5005,66 @@ fn spawn_load_drive(view: Entity<TDriveView>, index: usize, refresh: bool, cx: &
 
     // The hook's own copy of the view, taken before the load's task takes it.
     let hook_view = view.clone();
+    // A second task watches the read and keeps the shell told where it is, so
+    // a long read is a bar that moves rather than a message that never changes.
+    let watch_view = view.clone();
+    let watch_drive = drive_id;
+    let mut progress = tele::progress_receiver();
     cx.spawn(async move |cx| {
-        let result = cx
-            .background_spawn({
-                let client = client.clone();
-                async move {
-                    let (contents, state, newest) = tele::load_drive(&client, peer_ref, resume)?;
-                    // Store what was read so the next launch can resume. A
-                    // failed write costs a slower load, never a wrong one.
-                    let _ = cache::save(&cache::Snapshot {
-                        version: cache::VERSION,
-                        drive_id,
-                        newest_message_id: newest,
-                        state,
-                    });
-                    Ok::<_, String>(contents)
-                }
-            })
-            .await;
+        // The read says where it is, and the shell draws it. The read is on a
+        // thread of its own, so this is how the two talk.
+        while progress.changed().await.is_ok() {
+            let current = *progress.borrow();
+            let done = cx.update(|cx| {
+                watch_view.update(cx, |this, cx| {
+                    if this.state.active_dialog().map(|d| d.id) != Some(watch_drive) {
+                        return true;
+                    }
+                    this.state.load_progress = Some(current);
+                    // The bar moves whether or not the count has: a read that
+                    // is working on one long message still looks like work.
+                    this.state.load_sweep = (this.state.load_sweep + 0.04) % 1.0;
+                    cx.notify();
+                    this.state.files_loading
+                })
+            });
+            if done {
+                return;
+            }
+        }
+    })
+    .detach();
+    // The read runs on a thread of its own.
+    //
+    // It waits on the network for a long time — a large drive takes a minute
+    // or more, with pauses when Telegram asks one — and a read that held the
+    // shell's own background thread would stop the shell's timers with it, so
+    // the bar that says where the read is would never move. The thread
+    // carries the result back over a channel, and the shell waits on that.
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        match tele::load_drive(&client, peer_ref, resume) {
+            Ok((contents, state, newest)) => {
+                // Store what was read so the next launch can resume. A failed
+                // write costs a slower load, never a wrong one.
+                let _ = cache::save(&cache::Snapshot {
+                    version: cache::VERSION,
+                    drive_id,
+                    newest_message_id: newest,
+                    state,
+                });
+                let _ = sender.send(Ok(contents));
+            }
+            Err(message) => {
+                let _ = sender.send(Err(message));
+            }
+        }
+    });
+    cx.spawn(async move |cx| {
+        let result = match receiver.await {
+            Ok(result) => result,
+            Err(_) => Err("the read stopped".to_string()),
+        };
         cx.update(|cx| {
             view.update(cx, |this, cx| {
                 // Still the drive this request was started for?

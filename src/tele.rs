@@ -12,8 +12,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, BufWriter};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use grammers_client::media::{Media, PhotoSize};
@@ -53,7 +55,15 @@ pub async fn async_connect(creds: &Credentials, session_path: PathBuf) -> Result
         }
     }
     let SenderPool { runner, handle, .. } = SenderPool::new(Arc::clone(&session), creds.api_id);
-    let client = Client::new(handle);
+    let client = Client::with_configuration(
+        handle,
+        grammers_client::client::ClientConfiguration {
+            retry_policy: Box::new(AnnouncedSleep {
+                threshold: Duration::from_secs(60),
+            }),
+            auto_cache_peers: true,
+        },
+    );
     tokio::spawn(runner.run());
     Ok(client)
 }
@@ -277,6 +287,116 @@ struct OpMessage {
     kind: Option<FileKind>,
     size: Option<i64>,
     date: Option<DateTime<Utc>>,
+}
+
+/// How far a drive read has got.
+///
+/// A large drive is read in one go the first time, and that takes a while, so
+/// the read says where it is rather than leaving the reader to guess.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoadProgress {
+    /// The messages read from Telegram.
+    pub scanned: usize,
+    /// The operations found among them.
+    pub operations: usize,
+    /// The newest message read.
+    pub newest: i32,
+    /// How long Telegram has asked the read to wait, when it has.
+    pub waiting: Option<u64>,
+}
+
+/// Where the last read's progress is kept.
+///
+/// The read runs off the main thread and the shell is on it, so the two need a
+/// meeting place; this is it. A read that is not running leaves the numbers
+/// where they were, so the shell can show them until the next one starts.
+static PROGRESS_SCANNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PROGRESS_OPERATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PROGRESS_NEWEST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// How long the read is waiting, in seconds; zero when it is not waiting.
+static PROGRESS_WAITING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Where the read's progress is published, so a reader can watch it.
+///
+/// The read runs on a thread of its own and the shell is on another, so the
+/// two need a meeting place; this is it.
+static PROGRESS_CHANNEL: OnceLock<tokio::sync::watch::Sender<LoadProgress>> = OnceLock::new();
+
+/// The channel the progress is published on.
+fn progress_channel() -> &'static tokio::sync::watch::Sender<LoadProgress> {
+    PROGRESS_CHANNEL.get_or_init(|| tokio::sync::watch::Sender::new(LoadProgress::default()))
+}
+
+/// A place to watch the read's progress.
+pub fn progress_receiver() -> tokio::sync::watch::Receiver<LoadProgress> {
+    progress_channel().subscribe()
+}
+
+/// Note how far a read has got.
+fn report_progress(progress: LoadProgress) {
+    PROGRESS_SCANNED.store(progress.scanned, std::sync::atomic::Ordering::Relaxed);
+    PROGRESS_OPERATIONS.store(progress.operations, std::sync::atomic::Ordering::Relaxed);
+    PROGRESS_NEWEST.store(progress.newest, std::sync::atomic::Ordering::Relaxed);
+    PROGRESS_WAITING.store(
+        progress.waiting.unwrap_or_default(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // The watchers are told as well, so the shell can draw the bar without
+    // asking.
+    let _ = progress_channel().send(progress);
+}
+
+/// How far the last read has got.
+pub fn last_progress() -> LoadProgress {
+    let waiting = PROGRESS_WAITING.load(std::sync::atomic::Ordering::Relaxed);
+    LoadProgress {
+        scanned: PROGRESS_SCANNED.load(std::sync::atomic::Ordering::Relaxed),
+        operations: PROGRESS_OPERATIONS.load(std::sync::atomic::Ordering::Relaxed),
+        newest: PROGRESS_NEWEST.load(std::sync::atomic::Ordering::Relaxed),
+        waiting: (waiting > 0).then_some(waiting),
+    }
+}
+
+/// A retry policy that says when it is waiting.
+///
+/// Telegram asks a client that reads a channel's history too quickly to wait.
+/// The library's own policy waits in silence, which reads as a stuck
+/// application; this one says how long it is waiting, so the shell can say so
+/// while it waits.
+struct AnnouncedSleep {
+    /// The longest wait that is worth sitting out; a longer one is an error
+    /// the reader should hear about.
+    threshold: Duration,
+}
+
+impl grammers_client::client::RetryPolicy for AnnouncedSleep {
+    fn should_retry(
+        &self,
+        ctx: &grammers_client::client::RetryContext,
+    ) -> ControlFlow<(), Duration> {
+        match &ctx.error {
+            grammers_mtsender::InvocationError::Rpc(grammers_mtsender::RpcError {
+                code: 420,
+                value: Some(seconds),
+                ..
+            }) if ctx.fail_count.get() == 1 && *seconds as u64 <= self.threshold.as_secs() => {
+                announce_wait(*seconds as u64);
+                ControlFlow::Continue(Duration::from_secs(*seconds as u64))
+            }
+            grammers_mtsender::InvocationError::Io(_) if ctx.fail_count.get() == 1 => {
+                announce_wait(1);
+                ControlFlow::Continue(Duration::from_secs(1))
+            }
+            _ => ControlFlow::Break(()),
+        }
+    }
+}
+
+/// Note that the read has been asked to wait, and for how long.
+fn announce_wait(seconds: u64) {
+    let mut progress = last_progress();
+    progress.waiting = Some(seconds);
+    report_progress(progress);
 }
 
 /// One part of a multipart group, as the replay saw it.
@@ -965,6 +1085,9 @@ pub async fn async_load_drive(
     let mut seen: Vec<OpMessage> = Vec::new();
     let mut scanned = 0usize;
     let mut newest = since.unwrap_or_default();
+    // The read starts by saying it has begun, so the reader is not looking at
+    // an empty bar while the first page is on its way.
+    report_progress(LoadProgress::default());
     while let Some(message) = messages.next().await.map_err(|e| e.to_string())? {
         // Telegram serves history newest first, so the first message at or
         // below the watermark ends the read: everything older is already in
@@ -1005,7 +1128,24 @@ pub async fn async_load_drive(
             size,
             date: Some(message.date()),
         });
+        // The reader is told every so often, not every message: a drive with
+        // tens of thousands of messages would spend more time reporting than
+        // reading.
+        if scanned % 64 == 0 {
+            report_progress(LoadProgress {
+                scanned,
+                operations: seen.len(),
+                newest,
+                waiting: None,
+            });
+        }
     }
+    report_progress(LoadProgress {
+        scanned,
+        operations: seen.len(),
+        newest,
+        waiting: None,
+    });
 
     // Telegram serves history newest first and operations are only meaningful
     // in the order they were written, so replay them oldest first: a rename or

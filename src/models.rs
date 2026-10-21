@@ -667,6 +667,13 @@ pub struct AppState {
     /// does not re-sort the folder (which the original memoises for the same
     /// reason: a folder can hold six figures of entries).
     pub rows_version: u64,
+    /// Where the loading bar's sweep is, so it moves while a read runs.
+    pub load_sweep: f32,
+    /// How far the drive read has got, while it is reading.
+    ///
+    /// A large drive is read in one go the first time, and that takes a while,
+    /// so the read says where it is.
+    pub load_progress: Option<crate::tele::LoadProgress>,
     /// Message ids whose thumbnail is currently being fetched for the gallery,
     /// so the tile is not asked to download the same image twice.
     pub gallery_downloads: std::collections::HashSet<i32>,
@@ -747,6 +754,8 @@ impl Default for AppState {
             sort: SortState::default(),
             view: ViewMode::default(),
             rows_version: 0,
+            load_sweep: 0.0,
+            load_progress: None,
             gallery_downloads: std::collections::HashSet::new(),
             derivative_job: None,
             vault: None,
